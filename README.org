@@ -1,0 +1,9 @@
+#+TITLE: monad-mode
+#+AUTHOR: Laluxx
+
+Major-mode for the monad programming language
+
+#+begin_src emacs-lisp
+(use-package monad-mode
+  :ensure t)
+#+end_src
