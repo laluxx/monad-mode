@@ -2,7 +2,7 @@
 
 ;; Author: Laluxx
 ;; Version: 0.0.6
-;; Package-Requires: ((emacs "28.1") (rainbow-delimiters "2.1.3"))
+;; Package-Requires: ((emacs "29.1") (rainbow-delimiters "2.1.3"))
 ;; Keywords: languages
 ;; URL: https://github.com/laluxx/monad-mode
 
@@ -146,8 +146,9 @@ The backticks become visible again when point is inside the expression."
 ;;; Imenu — flat index with cached docstring annotations
 
 (defvar-local monad--docstring-cache nil
-  "Cache for definition docstrings.  Hash table mapping name strings to
-the first line of their docstring (or nil when there is none).")
+  "Cache for definition docstrings.
+Hash table mapping name strings to the first line of their docstring,
+or nil when there is none.")
 
 (defun monad--invalidate-docstring-cache ()
   "Clear the buffer-local docstring cache and column-alignment records."
@@ -174,8 +175,7 @@ Returns the first line of the docstring, or nil."
         (down-list 1)             ; enter (define ...)
         (forward-sexp 1)          ; skip "define"
         (skip-chars-forward " \t\n")
-        (let ((is-function (eq (char-after) ?\())
-              (is-typed-var (eq (char-after) ?\[)))
+        (let ((is-function (eq (char-after) ?\()))
           (forward-sexp 1)        ; skip header: (name ...) | [name :: T] | name
           (unless is-function
             (skip-chars-forward " \t\n")
@@ -276,7 +276,7 @@ Returns the first line of the docstring, or nil."
             (match-string-no-properties 1)))))))
 
 (defun monad-imenu-annotate (cand)
-  "Annotation function for Monad imenu candidates."
+  "Return an imenu annotation string for candidate CAND."
   (let* ((type-raw  (monad--imenu-type-annotation cand))
          (doc       (monad--get-cached-docstring cand))
          (col-a     (+ monad--imenu-max-name-len 2))
@@ -292,7 +292,7 @@ Returns the first line of the docstring, or nil."
          (propertize doc 'face 'font-lock-doc-face))))))
 
 (defun monad-char-literal-matcher (limit)
-  "Match character literals 'x' up to LIMIT."
+  "Match character literals \='x\=' up to LIMIT."
   (catch 'found
     (while (re-search-forward "'\\(.\\)'" limit t)
       (let ((matched-char (match-string 1)))
@@ -352,7 +352,7 @@ backtick pairs like `+` 22 `*` do not bleed into each other.")
 ;;; Electric pair for backtick
 
 (defun monad--setup-electric-pair ()
-  "Setup electric pairing of backticks in monad-mode."
+  "Setup electric pairing of backticks in `monad-mode'."
   (when (bound-and-true-p electric-pair-mode)
     (setq-local electric-pair-pairs
                 (append electric-pair-pairs '((?` . ?`))))
@@ -368,7 +368,7 @@ backtick pairs like `+` 22 `*` do not bleed into each other.")
 ;; Example:
 ;;   (x + y)        -- "x" is preceded by "(", so the + is left alone.
 ;;   new-players + players  -- "new-players" is NOT preceded by "(",
-;;                             so + becomes `+` automatically.
+;;                             so + becomes `+``` automatically.
 
 (defconst monad-infix-operator-chars
   '(?+ ?- ?* ?/ ?% ?< ?> ?= ?& ?| ?^ ?~ ?!)
@@ -376,6 +376,12 @@ backtick pairs like `+` 22 `*` do not bleed into each other.")
 Only single-character operator chars are checked here.")
 
 (defun monad--infix-auto-wrap-p ()
+  "Return non-nil when the operator just typed should be wrapped in backticks.
+Checks that point is not in an asm block, string, or comment, that the
+character just inserted is in `monad-infix-operator-chars', that
+electric-pair has not already inserted a closing backtick, and that the
+token to the left is not preceded by `(' which would make this a prefix
+call head rather than an infix operator."
   (and (not (monad-in-asm-form-p))
        (not (nth 3 (syntax-ppss)))
        (not (nth 4 (syntax-ppss)))
@@ -423,6 +429,8 @@ closing backtick ready to type the RHS."
 
 (defun monad-font-lock-extend-region ()
   "Extend font-lock region to cover complete asm forms."
+  (defvar font-lock-beg)
+  (defvar font-lock-end)
   (let ((changed nil))
     (save-excursion
       (goto-char font-lock-beg)
@@ -604,7 +612,7 @@ closing backtick ready to type the RHS."
      (mapcar (lambda (keyword)
                (let* ((matcher (if (consp keyword) (car keyword) keyword))
                       (highlighter (if (consp keyword) (cdr keyword)
-                                     font-lock-keyword-face))
+                                     'font-lock-keyword-face))
                       (face-spec (if (and (consp highlighter)
                                          (integerp (car highlighter)))
                                     highlighter
@@ -694,8 +702,8 @@ Uses the nearest enclosing PAREN (not bracket) to find the call head."
 
 (defun monad--point-in-define-annotation-p ()
   "Return non-nil when point is inside a typed `define' annotation bracket.
-Matches `(define [name :: Type] value)' -- point is anywhere inside the [...].
-Returns non-nil (the bracket start position) when the condition holds, nil otherwise."
+Matches `(define [name :: Type] value)' -- point is anywhere inside [...].
+Returns non-nil when the condition holds, nil otherwise."
   (save-excursion
     (condition-case nil
         (progn
@@ -792,10 +800,9 @@ Requires the enclosing delimiter to be `(' -- bracket-enclosed symbols like
 ;;;; Parameter extraction
 
 (defun monad--parse-param-names (header-str)
-  "Parse parameter names from a function HEADER-STR like \"(fn [x :: T] -> [y :: T] -> R)\".
-Returns a list of parameter name strings in order.
-Only names inside [name :: ...] blocks are collected; the return type
-and the function name itself are ignored."
+  "Parse parameter names from a function HEADER-STR.
+Example: \"(fn [x :: T] -> [y :: T] -> R)\".
+Returns a list of parameter name strings in order."
   (let (params (i 0))
     (while (string-match "\\[\\([a-z_][A-Za-z0-9_']*\\)[ \t]*::" header-str i)
       (push (match-string-no-properties 1 header-str) params)
@@ -817,7 +824,7 @@ are past the first argument, etc.)."
           ;; Skip the function name; if it fails, signal so outer handler returns nil
           (condition-case nil
               (forward-sexp 1)
-            (error (error "skip-fn-failed")))
+            (error (error "Skip-fn-failed")))
           ;; Count argument sexps between function name and orig
           (catch 'monad--arg-done
             (let ((idx 0))
@@ -839,7 +846,7 @@ are past the first argument, etc.)."
 (defun monad--propertize-signature-with-active-param (sig active-idx)
   "Return SIG propertized with ACTIVE-IDX parameter highlighted.
 ACTIVE-IDX is zero-based.  Pass -1 to put ALL param names in default face
-(used when hovering the function name itself — no slot is being filled)."
+\(used when hovering the function name — no slot is being filled)."
   (let ((s (monad--propertize-signature sig))
         (param-spans '())
         (i 0))
@@ -871,8 +878,7 @@ Only returns a name when we are inside the argument list of a call."
           (skip-chars-forward " \t\n")
           ;; Read what's at the function position
           (when (looking-at "\\(?:\\sw\\|\\s_\\)+")
-            (let ((fn-name (match-string-no-properties 0))
-                  (fn-end  (match-end 0)))
+            (let ((fn-name (match-string-no-properties 0)))
               ;; Make sure point (before up-list) was PAST the function name
               ;; i.e. we are in the argument portion of the form, not on the fn itself
               fn-name)))
@@ -1059,7 +1065,7 @@ Priority rules:
            (monad--hover-doc sym-name))))))))
 
 (defun monad-eldoc-function (callback &rest _ignored)
-  "Eldoc documentation function for Monad mode."
+  "Call CALLBACK with the eldoc documentation string for the current context."
   (when-let* ((doc (monad--eldoc-get-doc)))
     (funcall callback doc)
     t))
@@ -1088,7 +1094,7 @@ Priority rules:
   (setq-local imenu-syntax-alist '(("+-*/.<>=?!$%_&~^:" . "w")))
   (setq-local completion-extra-properties
               (list :annotation-function #'monad-imenu-annotate))
-  (with-eval-after-load 'marginalia
+  (when (fboundp 'marginalia-annotators)
     (add-to-list 'marginalia-annotators
                  '(imenu monad-imenu-annotate builtin none)))
   (add-hook 'after-change-functions
@@ -1226,7 +1232,7 @@ Each symbol is propertized with the correct `company-kind': `function' or
     (nreverse candidates)))
 
 (defun monad--asm-first-token-p (start)
-  "Return t if START is the position of the first token on its line in an asm block."
+  "Return t if START is the first token position on its line in an asm block."
   (save-excursion
     (goto-char start)
     (skip-chars-backward " \t")
@@ -1271,7 +1277,7 @@ Each symbol is propertized with the correct `company-kind': `function' or
       (puthash c (get-text-property 0 'company-kind c) table))
     (lambda (cand) (gethash cand table))))
 
-(with-eval-after-load 'nerd-icons-corfu
+(when (boundp 'nerd-icons-corfu-mapping)
   (add-to-list 'nerd-icons-corfu-mapping
                '(monad-asm :fn (lambda (_cand)
                                  (concat (nerd-icons-sucicon "nf-seti-asm") " "))
@@ -1401,7 +1407,7 @@ Each symbol is propertized with the correct `company-kind': `function' or
         (monad--find-all-defines (current-buffer) bare)))))
 
 (defun monad--find-module-location (module-name)
-  "Return an xref location jumping to the module name inside its declaration."
+  "Return an xref location for MODULE-NAME inside its module declaration."
   (when-let* ((file (monad--module-file module-name)))
     (when (file-readable-p file)
       (with-current-buffer (find-file-noselect file)

@@ -5,5 +5,8 @@ Major-mode for the monad programming language
 
 #+begin_src emacs-lisp
 (use-package monad-mode
-  :ensure t)
+  :ensure t
+  :config
+  (setq monad-highlight-arrow nil)     ; Highlight the -> arrow with keyword face (default: nil)
+  (setq monad-infix-hide-backticks t)) ; Hide the surrounding backticks of infix expressions like `+` (default: t)
 #+end_src
