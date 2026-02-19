@@ -302,8 +302,10 @@ Returns the first line of the docstring, or nil."
 
 ;;; Infix backtick support
 
-(defconst monad-infix-regexp "`\\([^`\n]+\\)`"
-  "Regexp matching infix backtick expressions.")
+(defconst monad-infix-regexp "`\\([^`\n\t ]+\\)`"
+  "Regexp matching infix backtick expressions.
+Group 1 matches only non-whitespace characters so that consecutive
+backtick pairs like `+` 22 `*` do not bleed into each other.")
 
 (defun monad-infix-matcher (limit)
   "Font-lock matcher for infix backtick expressions up to LIMIT."
@@ -328,6 +330,8 @@ Returns the first line of the docstring, or nil."
           (scan-start (save-excursion (forward-line -3) (point)))
           (scan-end   (save-excursion (forward-line  3) (point))))
       (with-silent-modifications
+        ;; Clear ALL invisible properties first to prevent stale ones accumulating
+        (remove-text-properties scan-start scan-end '(invisible nil))
         (save-excursion
           (goto-char scan-start)
           (while (re-search-forward monad-infix-regexp scan-end t)
@@ -335,7 +339,7 @@ Returns the first line of the docstring, or nil."
                   (mend   (match-end 0)))
               (when monad-infix-hide-backticks
                 (put-text-property mstart (1+ mstart) 'invisible t)
-                (put-text-property (1- mend) mend     'invisible t)))))))))
+                (put-text-property (1- mend) mend 'invisible t)))))))))
 
 (defun monad-infix-schedule-refresh ()
   "Schedule a backtick visibility refresh via idle timer."
@@ -354,6 +358,47 @@ Returns the first line of the docstring, or nil."
                 (append electric-pair-pairs '((?` . ?`))))
     (setq-local electric-pair-text-pairs
                 (append electric-pair-text-pairs '((?` . ?`))))))
+
+;;;; Infix operator auto-wrapping
+;;
+;; When the user types an operator character (+, -, *, /, etc.) and the token
+;; immediately to the left is NOT preceded by "(" (i.e. we are not already
+;; inside a normal prefix call), automatically wrap the operator in backticks.
+;;
+;; Example:
+;;   (x + y)        -- "x" is preceded by "(", so the + is left alone.
+;;   new-players + players  -- "new-players" is NOT preceded by "(",
+;;                             so + becomes `+` automatically.
+
+(defconst monad-infix-operator-chars
+  '(?+ ?- ?* ?/ ?% ?< ?> ?= ?& ?| ?^ ?~ ?!)
+  "Characters that trigger infix auto-wrapping when typed as a bare operator.
+Only single-character operator chars are checked here.")
+
+(defun monad--infix-auto-wrap-p ()
+  (and (not (monad-in-asm-form-p))
+       (not (nth 3 (syntax-ppss)))
+       (not (nth 4 (syntax-ppss)))
+       (> (point) 2)
+       (memq (char-before) monad-infix-operator-chars)
+       ;; Don't wrap if electric-pair already inserted a closing backtick
+       (not (eq (char-after) ?`))
+       (save-excursion
+         (backward-char 1)
+         (skip-chars-backward " \t")
+         (not (eq (char-before) ?\()))))
+
+(defun monad--infix-do-wrap ()
+  "Wrap the operator just typed in backticks.
+Transforms `...lhs OP' into `...lhs `OP`', leaving point after the
+closing backtick ready to type the RHS."
+  (let ((op-end (point)))
+    (save-excursion
+      (backward-char 1)
+      (insert "`"))
+    ;; op-end is now off by one due to the inserted backtick
+    (goto-char (1+ op-end))
+    (insert "`")))
 
 ;; Assembly syntax highlighting support
 
@@ -435,14 +480,18 @@ Returns the first line of the docstring, or nil."
     (lisp-indent-line)))
 
 (defun monad-post-self-insert ()
-  "Handle post-insertion fontification in asm blocks."
+  "Handle post-insertion actions: asm fontification and infix operator wrapping."
+  ;; Asm block: re-fontify the current line when a colon is typed (label detection).
   (when (and (monad-in-asm-form-p)
              (eq (char-before) ?:))
     (save-excursion
       (let ((line-start (line-beginning-position))
             (line-end (line-end-position)))
         (font-lock-flush line-start line-end)
-        (font-lock-fontify-region line-start line-end)))))
+        (font-lock-fontify-region line-start line-end))))
+  ;; Infix operator: wrap bare operator in backticks when LHS is not a call head.
+  (when (monad--infix-auto-wrap-p)
+    (monad--infix-do-wrap)))
 
 (defun monad-colon ()
   "Insert a colon and auto-indent if in asm block."
@@ -601,8 +650,8 @@ Returns the first line of the docstring, or nil."
                  0))
            (error 0))))))
 
-;;;; Eldoc integration
-
+;;; Eldoc integration
+;;
 ;; - No eldoc when the cursor is immediately after (touching) a symbol.
 ;;   "After a symbol" means: the char before point is a word/symbol
 ;;   constituent AND point is NOT preceded by whitespace or an open paren.
@@ -1213,7 +1262,7 @@ Each symbol is propertized with the correct `company-kind': `function' or
            (monad--collect-defines)
            (monad--import-completions (monad--parse-imports)))))
 
-;;; Completion-at-point
+;;;; Completion-at-point
 
 (defun monad--kind-function (candidates)
   "Return a `company-kind' function over CANDIDATES."
