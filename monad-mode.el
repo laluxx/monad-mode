@@ -1,9 +1,11 @@
 ;;; monad-mode.el --- Major mode for the Monad programming language -*- lexical-binding: t; -*-
+
 ;; Author: Laluxx
 ;; Version: 0.0.5
 ;; Package-Requires: ((emacs "28.1") (rainbow-delimiters "2.1.3"))
 ;; Keywords: languages
 ;; URL: https://github.com/laluxx/monad-mode
+
 ;; This file is not part of GNU Emacs.
 ;; This program is free software; you can redistribute it and/or modify
 ;; it under the terms of the GNU General Public License as published by
@@ -15,7 +17,9 @@
 ;; GNU General Public License for more details.
 ;; You should have received a copy of the GNU General Public License
 ;; along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
 ;;; Commentary:
+
 ;; This package provides a major mode for editing Monad programming language.
 ;; Monad is a Lisp-like language with Scheme-like syntax and advanced
 ;; type system features.
@@ -32,7 +36,9 @@
 ;; - Eldoc integration: hover a function to see its signature; hover a variable
 ;;   to see its type annotation and/or value — with preserved syntax colors.
 ;; - rainbow-delimiters enabled by default with depth-2 for () and depth-3 for []
+
 ;;; Code:
+
 (require 'lisp-mode)
 (require 'cl-lib)
 (require 'eldoc)
@@ -132,15 +138,81 @@ The backticks become visible again when point is inside the expression."
     "module" "import" "qualified" "as" "hiding" )
   "Keywords for the Monad programming language.")
 
-(defvar monad-imenu-generic-expression
-  `((nil
-     ,(rx bol (zero-or-more space)
-          "(define"
-          (one-or-more space)
-          (zero-or-one "(")
-          (group (one-or-more (or word (syntax symbol)))))
-     1))
-  "Imenu generic expression for Monad mode.")
+(defun monad--imenu-type-annotation (name)
+  "Return a short type/signature string for NAME, or nil.
+For functions returns the header sexp, e.g. \"(add [a :: Int] -> Int)\".
+For typed variables returns the annotation, e.g. \"[x :: Int]\"."
+  (save-excursion
+    (goto-char (point-min))
+    (let ((fn-rx (concat "^(define[ \t\n]+(\\("
+                         (regexp-quote name) "\\)\\b")))
+      (if (re-search-forward fn-rx nil t)
+          (progn
+            (goto-char (match-beginning 0))
+            (condition-case nil
+                (progn
+                  (down-list 1)
+                  (forward-sexp 1)        ; skip "define"
+                  (skip-chars-forward " \t\n")
+                  (let ((hdr-start (point)))
+                    (forward-sexp 1)      ; the whole (name ...) header
+                    (buffer-substring-no-properties hdr-start (point))))
+              (error nil)))
+        (goto-char (point-min))
+        (let ((tv-rx (concat "^(define[ \t\n]+\\(\\["
+                             (regexp-quote name)
+                             "[ \t]*::[^]\n]+\\]\\)")))
+          (when (re-search-forward tv-rx nil t)
+            (match-string-no-properties 1)))))))
+
+(defun monad--imenu-build-index ()
+  "Build the imenu index for Monad mode.
+Candidate strings carry an `imenu-annotation' text property with
+the type signature so that completion UIs that read this property
+\(e.g. consult-imenu) can display it.  The index is split into
+\"Functions\" and \"Variables\" sub-menus."
+  (let (functions variables)
+    (save-excursion
+      (goto-char (point-min))
+      (while (re-search-forward
+              "^(define[ \t\n]+\\(?:(\\|\\[?\\)\\(\\(?:\\sw\\|\\s_\\)+\\)"
+              nil t)
+        (let* ((name    (match-string-no-properties 1))
+               (pos     (copy-marker (match-beginning 1)))
+               (fn-p    (save-excursion
+                          (goto-char (match-beginning 0))
+                          (looking-at "(define[ \t\n]*(")))
+               (ann     (monad--imenu-type-annotation name))
+               (display (if ann
+                            (propertize name 'imenu-annotation (concat "  " ann))
+                          name)))
+          (if fn-p
+              (push (cons display pos) functions)
+            (push (cons display pos) variables)))))
+    (let (result)
+      (when variables
+        (push (cons "Variables" (nreverse variables)) result))
+      (when functions
+        (push (cons "Functions" (nreverse functions)) result))
+      result)))
+
+(defun monad--marginalia-annotate-imenu (cand)
+  "Annotate imenu CAND for Monad mode, or fall back to marginalia's default.
+In `monad-mode' buffers, reads the `imenu-annotation' text property
+stored by `monad--imenu-build-index' and formats it with `marginalia-type'
+face.  In all other modes defers to `marginalia-annotate-imenu'."
+  (if (derived-mode-p 'monad-mode)
+      (when-let* ((ann (get-text-property 0 'imenu-annotation cand)))
+        (marginalia--fields
+         (ann :truncate 1.0 :face 'marginalia-type)))
+    (marginalia-annotate-imenu cand)))
+
+(with-eval-after-load 'marginalia
+  ;; Replace the imenu annotator in `marginalia-annotators' so that
+  ;; our function runs for monad-mode buffers and delegates to
+  ;; marginalia's built-in annotator for all other modes.
+  (when-let* ((entry (assq 'imenu marginalia-annotators)))
+    (setcar (cdr entry) #'monad--marginalia-annotate-imenu)))
 
 (defun monad-char-literal-matcher (limit)
   "Match character literals 'x' up to LIMIT.
@@ -763,7 +835,7 @@ dispatch loop to display it a second time via the return value."
   (setq-local comment-column 40)
   (setq-local lisp-indent-function 'scheme-indent-function)
   (setq-local imenu-case-fold-search t)
-  (setq-local imenu-generic-expression monad-imenu-generic-expression)
+  (setq-local imenu-create-index-function #'monad--imenu-build-index)
   (setq-local imenu-syntax-alist '(("+-*/.<>=?!$%_&~^:" . "w")))
   ;; Set up syntax-propertize
   (setq-local syntax-propertize-function #'monad-syntax-propertize)
@@ -985,11 +1057,20 @@ Returns propertized strings with `company-kind' set to
           :company-kind kind-fn
           :annotation-function
           (lambda (cand)
+            ;; Like elisp-mode's " <f>" annotation, show a short type
+            ;; signature for functions and typed variables, falling back
+            ;; to a kind tag for keywords and asm instructions.
             (pcase (funcall kind-fn cand)
-              ('monad-asm " asm")
-              ('keyword   " keyword")
-              ('function  " function")
-              ('variable  " variable")
+              ('function
+               (if-let* ((hdr (monad--extract-function-header cand)))
+                   (concat " " hdr)
+                 " <function>"))
+              ('variable
+               (if-let* ((info (monad--extract-variable-info cand)))
+                   (concat " " info)
+                 " <variable>"))
+              ('monad-asm " <asm>")
+              ('keyword   " <keyword>")
               (_          ""))))))
 
 ;;;; Xref backend
@@ -1069,8 +1150,10 @@ a buffer position.  This handles any number of parameters separated by ->."
                   (insert hdr-str)
                   (goto-char (point-min))
                   (when (re-search-forward pat nil t)
-                    ;; +1 to land on the symbol name, skipping the [
-                    (setq result (+ hdr-open1 (match-beginning 0) 1))))
+                    ;; match-beginning 0 is position of [ in temp buffer (1-indexed),
+                    ;; so hdr-open1 + (match-beginning 0 - 1) + 1 = hdr-open1 + match-beginning 0.
+                    ;; No extra +1 needed — that was causing the off-by-one.
+                    (setq result (+ hdr-open1 (match-beginning 0)))))
                 (when result
                   (xref-make (concat symbol " (parameter)")
                              (xref-make-buffer-location
