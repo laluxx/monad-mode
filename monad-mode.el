@@ -1,7 +1,7 @@
 ;;; monad-mode.el --- Major mode for the Monad programming language -*- lexical-binding: t; -*-
 
 ;; Author: Laluxx
-;; Version: 0.0.5
+;; Version: 0.0.6
 ;; Package-Requires: ((emacs "28.1") (rainbow-delimiters "2.1.3"))
 ;; Keywords: languages
 ;; URL: https://github.com/laluxx/monad-mode
@@ -36,6 +36,7 @@
 ;; - Eldoc integration: hover a function to see its signature; hover a variable
 ;;   to see its type annotation and/or value — with preserved syntax colors.
 ;; - rainbow-delimiters enabled by default with depth-2 for () and depth-3 for []
+;; - Imenu shows type signature + first line of docstring (both styles supported)
 
 ;;; Code:
 
@@ -138,8 +139,168 @@ The backticks become visible again when point is inside the expression."
     "module" "import" "qualified" "as" "hiding" )
   "Keywords for the Monad programming language.")
 
+;;;; ─────────────────────────────────────────────────────────────────────────
+;;;; Imenu — flat index with cached docstring annotations
+;;;;
+;;;; Mirrors nytrix-mode's approach exactly:
+;;;;   • `monad--imenu-build-index'   — flat (name . pos) list, no sub-menus
+;;;;   • `monad--docstring-cache'     — buffer-local hash: name → first-line
+;;;;   • `monad--get-cached-docstring' — rebuild cache on demand
+;;;;   • `monad-imenu-annotate'       — annotation function shown by
+;;;;                                    consult-imenu / marginalia
+;;;;
+;;;; Two docstring styles are recognised (keywords in any order):
+;;;;
+;;;;   Style 1 — bare string right after the header:
+;;;;     (define (fn ...)
+;;;;       "Multiply X and Y as Chars"
+;;;;       body...)
+;;;;
+;;;;   Style 2 — :doc keyword property:
+;;;;     (define (fn ...)
+;;;;       :alias multiply-binary
+;;;;       :doc "Multiply X and Y as Hexs"
+;;;;       body...)
+;;;; ─────────────────────────────────────────────────────────────────────────
+
+(defvar-local monad--docstring-cache nil
+  "Cache for definition docstrings.  Hash table mapping name strings to
+the first line of their docstring (or nil when there is none).")
+
+(defun monad--invalidate-docstring-cache ()
+  "Clear the buffer-local docstring cache and column-alignment records."
+  (setq monad--docstring-cache nil
+        monad--imenu-max-name-len 0
+        monad--imenu-max-type-len 0))
+
+(defun monad--docstring-first-line (raw)
+  "Return the first non-blank line of RAW, trimmed, max 80 chars.
+Returns nil when RAW has no non-blank content."
+  (when raw
+    (let* ((lines (split-string raw "\n"))
+           (first (cl-find-if (lambda (l) (not (string-blank-p l))) lines)))
+      (when first
+        (let ((s (string-trim first)))
+          (if (> (length s) 80) (concat (substring s 0 77) "...") s))))))
+
+(defun monad--read-docstring-at-point ()
+  "Read the docstring of the definition whose header starts at point.
+Point must be at the opening `(' of a `(define ...)' form.
+Returns the first line of the docstring, or nil.
+
+After skipping `define' and the header sexp, an extra value sexp is
+skipped for variable forms so that a string value is never mistaken
+for a docstring:
+
+  Function  (define (name ...) \"doc\" body)  — scan immediately after header
+  Typed var (define [name :: T] value \"doc\") — skip value first
+  Plain var (define name value \"doc\")        — skip value first
+
+The docstring scan then accepts any mix of :keyword/value pairs
+\(Style 2) or a bare string literal (Style 1)."
+  (condition-case nil
+      (progn
+        (down-list 1)             ; enter (define ...)
+        (forward-sexp 1)          ; skip "define"
+        (skip-chars-forward " \t\n")
+        ;; Detect the header kind BEFORE consuming it.
+        (let ((is-function (eq (char-after) ?\())
+              (is-typed-var (eq (char-after) ?\[)))
+          (forward-sexp 1)        ; skip header: (name ...) | [name :: T] | name
+          ;; For variable forms (typed or plain) the next sexp is the value,
+          ;; not a docstring — skip it before starting the docstring scan.
+          (unless is-function
+            (skip-chars-forward " \t\n")
+            (condition-case nil (forward-sexp 1) (error nil))))
+        (let (doc done)
+          (while (not done)
+            (skip-chars-forward " \t\n")
+            (cond
+             ;; :doc "..." — docstring keyword (Style 2)
+             ((looking-at ":doc[ \t\n]+\"")
+              (goto-char (match-end 0))
+              (let ((s (1- (point))))
+                (goto-char s)
+                (forward-sexp 1)
+                (setq doc  (monad--docstring-first-line
+                            (buffer-substring-no-properties (1+ s) (1- (point))))
+                      done t)))
+             ;; Any other :keyword — skip keyword + value, keep scanning
+             ((looking-at ":\\(?:\\sw\\|\\s_\\)+")
+              (forward-sexp 1)
+              (skip-chars-forward " \t\n")
+              (condition-case nil (forward-sexp 1) (error (setq done t))))
+             ;; Bare string literal — Style 1 docstring
+             ((looking-at "\"")
+              (let ((s (point)))
+                (forward-sexp 1)
+                (setq doc  (monad--docstring-first-line
+                            (buffer-substring-no-properties (1+ s) (1- (point))))
+                      done t)))
+             ;; Body reached — no docstring
+             (t (setq done t))))
+          (and doc (not (string-empty-p doc)) doc)))
+    (error nil)))
+
+(defun monad--cache-docstrings ()
+  "Scan the buffer and build a fresh docstring cache.
+Returns a hash table mapping definition name strings to their
+first-line docstring (string) or nil."
+  (let ((cache (make-hash-table :test #'equal)))
+    (save-excursion
+      (goto-char (point-min))
+      (while (re-search-forward
+              "^(define[ \t\n]+\\(?:(\\|\\[?\\)\\(\\(?:\\sw\\|\\s_\\)+\\)"
+              nil t)
+        (let* ((name (match-string-no-properties 1))
+               (def-start (match-beginning 0))
+               (doc  (save-excursion
+                       (goto-char def-start)
+                       (monad--read-docstring-at-point))))
+          (puthash name doc cache))))
+    cache))
+
+(defun monad--get-cached-docstring (name)
+  "Return the cached docstring for NAME, rebuilding the cache if needed."
+  (unless monad--docstring-cache
+    (setq monad--docstring-cache (monad--cache-docstrings)))
+  (gethash name monad--docstring-cache))
+
+(defvar-local monad--imenu-max-name-len 0
+  "Length of the longest definition name in the current buffer's imenu index.
+Computed by `monad--imenu-build-index'.  Used by `monad-imenu-annotate' to
+align type signatures so they all start at the same column.")
+
+(defvar-local monad--imenu-max-type-len 0
+  "Length of the longest raw type string in the current buffer's imenu index.
+Computed by `monad--imenu-build-index'.  Used by `monad-imenu-annotate' to
+align docstrings so they all start at the same column.")
+
+(defun monad--imenu-build-index ()
+  "Build a flat imenu index for Monad mode.
+Returns a plain list of (name . pos) cons cells — no sub-menus, no category
+prefixes.  Also sets `monad--imenu-max-name-len' and
+`monad--imenu-max-type-len' so `monad-imenu-annotate' can align both columns."
+  (unless monad--docstring-cache
+    (setq monad--docstring-cache (monad--cache-docstrings)))
+  (let (index (max-name 0) (max-type 0))
+    (save-excursion
+      (goto-char (point-min))
+      (while (re-search-forward
+              "^(define[ \t\n]+\\(?:(\\|\\[?\\)\\(\\(?:\\sw\\|\\s_\\)+\\)"
+              nil t)
+        (let* ((name (match-string-no-properties 1))
+               (type (monad--imenu-type-annotation name))
+               (tlen (if type (length type) 0)))
+          (when (> (length name) max-name) (setq max-name (length name)))
+          (when (> tlen max-type)          (setq max-type tlen))
+          (push (cons name (copy-marker (match-beginning 1))) index))))
+    (setq monad--imenu-max-name-len max-name
+          monad--imenu-max-type-len max-type)
+    (nreverse index)))
+
 (defun monad--imenu-type-annotation (name)
-  "Return a short type/signature string for NAME, or nil.
+  "Return a raw (unpropertized) type/signature string for NAME, or nil.
 For functions returns the header sexp, e.g. \"(add [a :: Int] -> Int)\".
 For typed variables returns the annotation, e.g. \"[x :: Int]\"."
   (save-excursion
@@ -147,17 +308,16 @@ For typed variables returns the annotation, e.g. \"[x :: Int]\"."
     (let ((fn-rx (concat "^(define[ \t\n]+(\\("
                          (regexp-quote name) "\\)\\b")))
       (if (re-search-forward fn-rx nil t)
-          (progn
-            (goto-char (match-beginning 0))
-            (condition-case nil
-                (progn
-                  (down-list 1)
-                  (forward-sexp 1)        ; skip "define"
-                  (skip-chars-forward " \t\n")
-                  (let ((hdr-start (point)))
-                    (forward-sexp 1)      ; the whole (name ...) header
-                    (buffer-substring-no-properties hdr-start (point))))
-              (error nil)))
+          (condition-case nil
+              (progn
+                (goto-char (match-beginning 0))
+                (down-list 1)
+                (forward-sexp 1)
+                (skip-chars-forward " \t\n")
+                (let ((hdr-start (point)))
+                  (forward-sexp 1)
+                  (buffer-substring-no-properties hdr-start (point))))
+            (error nil))
         (goto-char (point-min))
         (let ((tv-rx (concat "^(define[ \t\n]+\\(\\["
                              (regexp-quote name)
@@ -165,54 +325,39 @@ For typed variables returns the annotation, e.g. \"[x :: Int]\"."
           (when (re-search-forward tv-rx nil t)
             (match-string-no-properties 1)))))))
 
-(defun monad--imenu-build-index ()
-  "Build the imenu index for Monad mode.
-Candidate strings carry an `imenu-annotation' text property with
-the type signature so that completion UIs that read this property
-\(e.g. consult-imenu) can display it.  The index is split into
-\"Functions\" and \"Variables\" sub-menus."
-  (let (functions variables)
-    (save-excursion
-      (goto-char (point-min))
-      (while (re-search-forward
-              "^(define[ \t\n]+\\(?:(\\|\\[?\\)\\(\\(?:\\sw\\|\\s_\\)+\\)"
-              nil t)
-        (let* ((name    (match-string-no-properties 1))
-               (pos     (copy-marker (match-beginning 1)))
-               (fn-p    (save-excursion
-                          (goto-char (match-beginning 0))
-                          (looking-at "(define[ \t\n]*(")))
-               (ann     (monad--imenu-type-annotation name))
-               (display (if ann
-                            (propertize name 'imenu-annotation (concat "  " ann))
-                          name)))
-          (if fn-p
-              (push (cons display pos) functions)
-            (push (cons display pos) variables)))))
-    (let (result)
-      (when variables
-        (push (cons "Variables" (nreverse variables)) result))
-      (when functions
-        (push (cons "Functions" (nreverse functions)) result))
-      result)))
+(defun monad-imenu-annotate (cand)
+  "Annotation function for Monad imenu candidates.
 
-(defun monad--marginalia-annotate-imenu (cand)
-  "Annotate imenu CAND for Monad mode, or fall back to marginalia's default.
-In `monad-mode' buffers, reads the `imenu-annotation' text property
-stored by `monad--imenu-build-index' and formats it with `marginalia-type'
-face.  In all other modes defers to `marginalia-annotate-imenu'."
-  (if (derived-mode-p 'monad-mode)
-      (when-let* ((ann (get-text-property 0 'imenu-annotation cand)))
-        (marginalia--fields
-         (ann :truncate 1.0 :face 'marginalia-type)))
-    (marginalia-annotate-imenu cand)))
+Layout (all entries aligned to the same columns):
 
-(with-eval-after-load 'marginalia
-  ;; Replace the imenu annotator in `marginalia-annotators' so that
-  ;; our function runs for monad-mode buffers and delegates to
-  ;; marginalia's built-in annotator for all other modes.
-  (when-let* ((entry (assq 'imenu marginalia-annotators)))
-    (setcar (cdr entry) #'monad--marginalia-annotate-imenu)))
+  name<pad-to-col-A>  type-signature<pad-to-col-B>  docstring
+
+Column A = longest name + 2.
+Column B = A + longest type + 2.
+
+The type is coloured with the same faces as eldoc:
+rainbow-delimiters depth faces on delimiters, `font-lock-builtin-face'
+on ::, `font-lock-function-name-face' on the function name,
+`font-lock-variable-name-face' on parameter names."
+  (let* ((type-raw  (monad--imenu-type-annotation cand))
+         (doc       (monad--get-cached-docstring cand))
+         ;; Column where the type column starts (absolute from left of candidate)
+         (col-a     (+ monad--imenu-max-name-len 2))
+         ;; Column where the doc column starts
+         (col-b     (+ col-a monad--imenu-max-type-len 2)))
+    (when (or type-raw doc)
+      (concat
+       ;; ── Pad from end of candidate name to type column ──────────────
+       (propertize " " 'display `(space :align-to ,col-a))
+       ;; ── Type signature with full syntax highlighting ───────────────
+       (when type-raw
+         (monad--propertize-signature type-raw))
+       ;; ── Pad from end of type to doc column ────────────────────────
+       (when doc
+         (propertize " " 'display `(space :align-to ,col-b)))
+       ;; ── Docstring ─────────────────────────────────────────────────
+       (when doc
+         (propertize doc 'face 'font-lock-doc-face))))))
 
 (defun monad-char-literal-matcher (limit)
   "Match character literals 'x' up to LIMIT.
@@ -255,7 +400,6 @@ Scans only a few lines around point; safe to call from a timer."
   (when (and (derived-mode-p 'monad-mode)
              (not monad-infix--updating))
     (let ((monad-infix--updating t)
-          (pt         (point))
           (scan-start (save-excursion (forward-line -3) (point)))
           (scan-end   (save-excursion (forward-line  3) (point))))
       (with-silent-modifications
@@ -593,41 +737,43 @@ depth counter so the correct face is always nesting-relative.
 Other faces:
   ::  operator       → `font-lock-builtin-face'
   Function name      → `font-lock-function-name-face'
-  Parameter names    → `font-lock-variable-name-face'"
+  Parameter names    → `font-lock-variable-name-face'
+
+All faces are applied with append=t (most-recently-added wins), so
+specific semantic faces always override the base delimiter colour."
   (let ((s (copy-sequence sig))
         (depth 0))
-    ;; ── Delimiters: nesting-depth-based faces ────────────────────────────
+    ;; ── Delimiters first (base layer) ────────────────────────────────────
     (dotimes (i (length s))
       (let ((ch (aref s i)))
         (cond
          ((memq ch '(?\( ?\[))
           (setq depth (1+ depth))
-          (add-face-text-property i (1+ i) (monad--depth-face depth) nil s))
+          (add-face-text-property i (1+ i) (monad--depth-face depth) t s))
          ((memq ch '(?\) ?\]))
-          (add-face-text-property i (1+ i) (monad--depth-face depth) nil s)
+          (add-face-text-property i (1+ i) (monad--depth-face depth) t s)
           (setq depth (max 0 (1- depth)))))))
-    ;; ── :: operator ─────────────────────────────────────────────────────
+    ;; ── :: operator (on top of delimiter colour if it coincides) ─────────
     (let ((i 0))
       (while (string-match "::" s i)
         (add-face-text-property (match-beginning 0) (match-end 0)
-                                'font-lock-builtin-face nil s)
+                                'font-lock-builtin-face t s)
         (setq i (match-end 0))))
-    ;; ── Function name: first word after leading "(" ──────────────────────
+    ;; ── Function name: first word after leading "(" ───────────────────────
     (when (string-match "^(\\([A-Za-z_][A-Za-z0-9_'!?$%&*/+<=>.^~-]*\\)" s)
       (add-face-text-property (match-beginning 1) (match-end 1)
-                              'font-lock-function-name-face nil s))
-    ;; ── Variable name at top-level "[name :: ..." ────────────────────────
+                              'font-lock-function-name-face t s))
+    ;; ── Variable name at top-level "[name :: ..." ─────────────────────────
     (when (string-match "^\\[\\([A-Za-z_][A-Za-z0-9_'!?$%&*/+<=>.^~-]*\\)[ \t]*::" s)
       (add-face-text-property (match-beginning 1) (match-end 1)
-                              'font-lock-variable-name-face nil s))
-    ;; ── Parameter names inside [...] blocks ─────────────────────────────
+                              'font-lock-variable-name-face t s))
+    ;; ── Parameter names inside [...] blocks ──────────────────────────────
     (let ((i 0))
       (while (string-match "\\[\\([a-z_][A-Za-z0-9_']*\\)[ \t]*::" s i)
         (add-face-text-property (match-beginning 1) (match-end 1)
-                                'font-lock-variable-name-face nil s)
+                                'font-lock-variable-name-face t s)
         (setq i (match-end 0))))
-    ;; ── String literals "..." → font-lock-string-face ───────────────────
-    ;; Simple scan: find opening ", scan to closing " respecting \".
+    ;; ── String literals "..." ─────────────────────────────────────────────
     (let ((i 0) (len (length s)))
       (while (< i len)
         (if (eq (aref s i) ?\")
@@ -637,14 +783,14 @@ Other faces:
                           (not (and (eq (aref s i) ?\")
                                     (not (eq (aref s (1- i)) ?\\)))))
                 (setq i (1+ i)))
-              (when (< i len) (setq i (1+ i))) ; consume closing "
-              (add-face-text-property start i 'font-lock-string-face nil s))
+              (when (< i len) (setq i (1+ i)))
+              (add-face-text-property start i 'font-lock-string-face t s))
           (setq i (1+ i)))))
-    ;; ── Character literals 'x' → font-lock-string-face ──────────────────
+    ;; ── Character literals 'x' ───────────────────────────────────────────
     (let ((i 0))
       (while (string-match "'\\(.\\)'" s i)
         (add-face-text-property (match-beginning 0) (match-end 0)
-                                'font-lock-string-face nil s)
+                                'font-lock-string-face t s)
         (setq i (match-end 0))))
     s))
 
@@ -682,7 +828,7 @@ simply extract the first sexp following the name as the value and stop.
 This works correctly for strings, chars, numbers, and compound expressions."
   (save-excursion
     (goto-char (point-min))
-    ;; \u2500\u2500 Typed form: (define [name :: Type] value) \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+    ;; ── Typed form: (define [name :: Type] value) ────────────────────────
     (let ((typed-rx (concat "^(define[ \t\n]+\\(\\["
                             (regexp-quote name)
                             "[ \t]*::[^]\n]+\\]\\)")))
@@ -697,7 +843,7 @@ This works correctly for strings, chars, numbers, and compound expressions."
                           (string-trim
                            (buffer-substring-no-properties val-start (point)))))
               (error nil)))
-        ;; \u2500\u2500 Plain form: (define name value) \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+        ;; ── Plain form: (define name value) ─────────────────────────────
         (goto-char (point-min))
         (let ((plain-rx (concat "^(define[ \t\n]+"
                                 (regexp-quote name)
@@ -837,6 +983,17 @@ dispatch loop to display it a second time via the return value."
   (setq-local imenu-case-fold-search t)
   (setq-local imenu-create-index-function #'monad--imenu-build-index)
   (setq-local imenu-syntax-alist '(("+-*/.<>=?!$%_&~^:" . "w")))
+  ;; Annotation function for consult-imenu and built-in completion
+  (setq-local completion-extra-properties
+              (list :annotation-function #'monad-imenu-annotate))
+  ;; Marginalia integration (mirrors nytrix-mode)
+  (with-eval-after-load 'marginalia
+    (add-to-list 'marginalia-annotators
+                 '(imenu monad-imenu-annotate builtin none)))
+  ;; Invalidate the docstring cache whenever the buffer changes
+  (add-hook 'after-change-functions
+            (lambda (&rest _) (monad--invalidate-docstring-cache))
+            nil t)
   ;; Set up syntax-propertize
   (setq-local syntax-propertize-function #'monad-syntax-propertize)
   ;; Set up font-lock extension for asm forms
@@ -1119,12 +1276,7 @@ Returns propertized strings with `company-kind' set to
 
 (defun monad--find-parameters (symbol)
   "Search for SYMBOL as a typed parameter in the enclosing `(define (fn ...))'.
-Returns an xref location pointing to the symbol inside the header, or nil.
-
-The header has the form: (fn [a :: T] -> [b :: T] -> RetT)
-We extract the raw header string between the outer parens, scan it with a
-regexp for `[SYMBOL :: ...' occurrences, then map the match offset back to
-a buffer position.  This handles any number of parameters separated by ->."
+Returns an xref location pointing to the symbol inside the header, or nil."
   (save-excursion
     (condition-case nil
         (progn
@@ -1142,7 +1294,6 @@ a buffer position.  This handles any number of parameters separated by ->."
                      (hdr-close (1- (point)))
                      (hdr-str   (buffer-substring-no-properties
                                  hdr-open1 hdr-close))
-                     ;; Regexp: [SYMBOL whitespace ::
                      (pat       (concat "\\[" (regexp-quote symbol)
                                         "[ \t]*::"))
                      result)
@@ -1150,9 +1301,6 @@ a buffer position.  This handles any number of parameters separated by ->."
                   (insert hdr-str)
                   (goto-char (point-min))
                   (when (re-search-forward pat nil t)
-                    ;; match-beginning 0 is position of [ in temp buffer (1-indexed),
-                    ;; so hdr-open1 + (match-beginning 0 - 1) + 1 = hdr-open1 + match-beginning 0.
-                    ;; No extra +1 needed — that was causing the off-by-one.
                     (setq result (+ hdr-open1 (match-beginning 0)))))
                 (when result
                   (xref-make (concat symbol " (parameter)")
@@ -1221,10 +1369,77 @@ a buffer position.  This handles any number of parameters separated by ->."
              mods
              (monad--import-completions imports)))))
 
+(defun monad--read-full-docstring-at-point ()
+  "Like `monad--read-docstring-at-point' but returns the full docstring text.
+Point must be at the opening `(' of a `(define ...)' form."
+  (condition-case nil
+      (progn
+        (down-list 1)
+        (forward-sexp 1)              ; skip "define"
+        (skip-chars-forward " \t\n")
+        (let ((is-function (eq (char-after) ?\()))
+          (forward-sexp 1)            ; skip header
+          (unless is-function
+            (skip-chars-forward " \t\n")
+            (condition-case nil (forward-sexp 1) (error nil))))
+        (let (doc done)
+          (while (not done)
+            (skip-chars-forward " \t\n")
+            (cond
+             ((looking-at ":doc[ \t\n]+\"")
+              (goto-char (match-end 0))
+              (let ((s (1- (point))))
+                (goto-char s)
+                (forward-sexp 1)
+                (setq doc  (buffer-substring-no-properties (1+ s) (1- (point)))
+                      done t)))
+             ((looking-at ":\\(?:\\sw\\|\\s_\\)+")
+              (forward-sexp 1)
+              (skip-chars-forward " \t\n")
+              (condition-case nil (forward-sexp 1) (error (setq done t))))
+             ((looking-at "\"")
+              (let ((s (point)))
+                (forward-sexp 1)
+                (setq doc  (buffer-substring-no-properties (1+ s) (1- (point)))
+                      done t)))
+             (t (setq done t))))
+          (and doc (not (string-empty-p doc)) (string-trim doc))))
+    (error nil)))
+
+(defun monad--full-docstring-for (name)
+  "Return the full docstring text for NAME, or nil.
+Searches the current buffer for NAME's definition form."
+  (save-excursion
+    (goto-char (point-min))
+    (let ((fn-rx  (concat "^(define[ \t\n]+(\\(" (regexp-quote name) "\\)\\b"))
+          (var-rx (concat "^(define[ \t\n]+\\[?\\(" (regexp-quote name) "\\)\\b")))
+      (let ((pos (or (and (re-search-forward fn-rx nil t)  (match-beginning 0))
+                     (progn (goto-char (point-min))
+                            (and (re-search-forward var-rx nil t) (match-beginning 0))))))
+        (when pos
+          (goto-char pos)
+          (monad--read-full-docstring-at-point))))))
+
+(defun monad-show-docstring ()
+  "Show the full docstring of the symbol at point in the minibuffer.
+Displays the text with `font-lock-doc-face'.  Works for both functions
+and variables (typed or plain).  Reports an error when no symbol is
+found at point or no docstring is defined for it."
+  (interactive)
+  (let* ((sym  (symbol-at-point))
+         (name (and sym (symbol-name sym))))
+    (unless name
+      (user-error "No symbol at point"))
+    (let ((doc (monad--full-docstring-for name)))
+      (unless doc
+        (user-error "No docstring for `%s'" name))
+      (message "%s" (propertize doc 'face 'font-lock-doc-face)))))
+
 (defvar-keymap monad-mode-map
   :doc "Keymap for Monad mode."
   :parent lisp-mode-shared-map
-  ":" #'monad-colon)
+  ":" #'monad-colon
+  "C-c C-d" #'monad-show-docstring)
 
 ;;;###autoload
 (define-derived-mode monad-mode prog-mode "Monad"
