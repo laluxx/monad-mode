@@ -35,6 +35,10 @@
 ;;   with optional backtick hiding (see `monad-infix-hide-backticks')
 ;; - Eldoc integration: hover a function to see its signature; hover a variable
 ;;   to see its type annotation and/or value — with preserved syntax colors.
+;;   Eldoc does NOT trigger when the cursor is immediately after a symbol token.
+;;   When calling a function, the current parameter is highlighted with
+;;   font-lock-variable-name-face and all others use the default face,
+;;   exactly like emacs-lisp-mode's parameter tracking.
 ;; - rainbow-delimiters enabled by default with depth-2 for () and depth-3 for []
 ;; - Imenu shows type signature + first line of docstring (both styles supported)
 
@@ -141,26 +145,6 @@ The backticks become visible again when point is inside the expression."
 
 ;;;; ─────────────────────────────────────────────────────────────────────────
 ;;;; Imenu — flat index with cached docstring annotations
-;;;;
-;;;; Mirrors nytrix-mode's approach exactly:
-;;;;   • `monad--imenu-build-index'   — flat (name . pos) list, no sub-menus
-;;;;   • `monad--docstring-cache'     — buffer-local hash: name → first-line
-;;;;   • `monad--get-cached-docstring' — rebuild cache on demand
-;;;;   • `monad-imenu-annotate'       — annotation function shown by
-;;;;                                    consult-imenu / marginalia
-;;;;
-;;;; Two docstring styles are recognised (keywords in any order):
-;;;;
-;;;;   Style 1 — bare string right after the header:
-;;;;     (define (fn ...)
-;;;;       "Multiply X and Y as Chars"
-;;;;       body...)
-;;;;
-;;;;   Style 2 — :doc keyword property:
-;;;;     (define (fn ...)
-;;;;       :alias multiply-binary
-;;;;       :doc "Multiply X and Y as Hexs"
-;;;;       body...)
 ;;;; ─────────────────────────────────────────────────────────────────────────
 
 (defvar-local monad--docstring-cache nil
@@ -186,29 +170,15 @@ Returns nil when RAW has no non-blank content."
 (defun monad--read-docstring-at-point ()
   "Read the docstring of the definition whose header starts at point.
 Point must be at the opening `(' of a `(define ...)' form.
-Returns the first line of the docstring, or nil.
-
-After skipping `define' and the header sexp, an extra value sexp is
-skipped for variable forms so that a string value is never mistaken
-for a docstring:
-
-  Function  (define (name ...) \"doc\" body)  — scan immediately after header
-  Typed var (define [name :: T] value \"doc\") — skip value first
-  Plain var (define name value \"doc\")        — skip value first
-
-The docstring scan then accepts any mix of :keyword/value pairs
-\(Style 2) or a bare string literal (Style 1)."
+Returns the first line of the docstring, or nil."
   (condition-case nil
       (progn
         (down-list 1)             ; enter (define ...)
         (forward-sexp 1)          ; skip "define"
         (skip-chars-forward " \t\n")
-        ;; Detect the header kind BEFORE consuming it.
         (let ((is-function (eq (char-after) ?\())
               (is-typed-var (eq (char-after) ?\[)))
           (forward-sexp 1)        ; skip header: (name ...) | [name :: T] | name
-          ;; For variable forms (typed or plain) the next sexp is the value,
-          ;; not a docstring — skip it before starting the docstring scan.
           (unless is-function
             (skip-chars-forward " \t\n")
             (condition-case nil (forward-sexp 1) (error nil))))
@@ -216,7 +186,6 @@ The docstring scan then accepts any mix of :keyword/value pairs
           (while (not done)
             (skip-chars-forward " \t\n")
             (cond
-             ;; :doc "..." — docstring keyword (Style 2)
              ((looking-at ":doc[ \t\n]+\"")
               (goto-char (match-end 0))
               (let ((s (1- (point))))
@@ -225,27 +194,22 @@ The docstring scan then accepts any mix of :keyword/value pairs
                 (setq doc  (monad--docstring-first-line
                             (buffer-substring-no-properties (1+ s) (1- (point))))
                       done t)))
-             ;; Any other :keyword — skip keyword + value, keep scanning
              ((looking-at ":\\(?:\\sw\\|\\s_\\)+")
               (forward-sexp 1)
               (skip-chars-forward " \t\n")
               (condition-case nil (forward-sexp 1) (error (setq done t))))
-             ;; Bare string literal — Style 1 docstring
              ((looking-at "\"")
               (let ((s (point)))
                 (forward-sexp 1)
                 (setq doc  (monad--docstring-first-line
                             (buffer-substring-no-properties (1+ s) (1- (point))))
                       done t)))
-             ;; Body reached — no docstring
              (t (setq done t))))
           (and doc (not (string-empty-p doc)) doc)))
     (error nil)))
 
 (defun monad--cache-docstrings ()
-  "Scan the buffer and build a fresh docstring cache.
-Returns a hash table mapping definition name strings to their
-first-line docstring (string) or nil."
+  "Scan the buffer and build a fresh docstring cache."
   (let ((cache (make-hash-table :test #'equal)))
     (save-excursion
       (goto-char (point-min))
@@ -266,21 +230,11 @@ first-line docstring (string) or nil."
     (setq monad--docstring-cache (monad--cache-docstrings)))
   (gethash name monad--docstring-cache))
 
-(defvar-local monad--imenu-max-name-len 0
-  "Length of the longest definition name in the current buffer's imenu index.
-Computed by `monad--imenu-build-index'.  Used by `monad-imenu-annotate' to
-align type signatures so they all start at the same column.")
-
-(defvar-local monad--imenu-max-type-len 0
-  "Length of the longest raw type string in the current buffer's imenu index.
-Computed by `monad--imenu-build-index'.  Used by `monad-imenu-annotate' to
-align docstrings so they all start at the same column.")
+(defvar-local monad--imenu-max-name-len 0)
+(defvar-local monad--imenu-max-type-len 0)
 
 (defun monad--imenu-build-index ()
-  "Build a flat imenu index for Monad mode.
-Returns a plain list of (name . pos) cons cells — no sub-menus, no category
-prefixes.  Also sets `monad--imenu-max-name-len' and
-`monad--imenu-max-type-len' so `monad-imenu-annotate' can align both columns."
+  "Build a flat imenu index for Monad mode."
   (unless monad--docstring-cache
     (setq monad--docstring-cache (monad--cache-docstrings)))
   (let (index (max-name 0) (max-type 0))
@@ -300,9 +254,7 @@ prefixes.  Also sets `monad--imenu-max-name-len' and
     (nreverse index)))
 
 (defun monad--imenu-type-annotation (name)
-  "Return a raw (unpropertized) type/signature string for NAME, or nil.
-For functions returns the header sexp, e.g. \"(add [a :: Int] -> Int)\".
-For typed variables returns the annotation, e.g. \"[x :: Int]\"."
+  "Return a raw (unpropertized) type/signature string for NAME, or nil."
   (save-excursion
     (goto-char (point-min))
     (let ((fn-rx (concat "^(define[ \t\n]+(\\("
@@ -326,42 +278,23 @@ For typed variables returns the annotation, e.g. \"[x :: Int]\"."
             (match-string-no-properties 1)))))))
 
 (defun monad-imenu-annotate (cand)
-  "Annotation function for Monad imenu candidates.
-
-Layout (all entries aligned to the same columns):
-
-  name<pad-to-col-A>  type-signature<pad-to-col-B>  docstring
-
-Column A = longest name + 2.
-Column B = A + longest type + 2.
-
-The type is coloured with the same faces as eldoc:
-rainbow-delimiters depth faces on delimiters, `font-lock-builtin-face'
-on ::, `font-lock-function-name-face' on the function name,
-`font-lock-variable-name-face' on parameter names."
+  "Annotation function for Monad imenu candidates."
   (let* ((type-raw  (monad--imenu-type-annotation cand))
          (doc       (monad--get-cached-docstring cand))
-         ;; Column where the type column starts (absolute from left of candidate)
          (col-a     (+ monad--imenu-max-name-len 2))
-         ;; Column where the doc column starts
          (col-b     (+ col-a monad--imenu-max-type-len 2)))
     (when (or type-raw doc)
       (concat
-       ;; ── Pad from end of candidate name to type column ──────────────
        (propertize " " 'display `(space :align-to ,col-a))
-       ;; ── Type signature with full syntax highlighting ───────────────
        (when type-raw
          (monad--propertize-signature type-raw))
-       ;; ── Pad from end of type to doc column ────────────────────────
        (when doc
          (propertize " " 'display `(space :align-to ,col-b)))
-       ;; ── Docstring ─────────────────────────────────────────────────
        (when doc
          (propertize doc 'face 'font-lock-doc-face))))))
 
 (defun monad-char-literal-matcher (limit)
-  "Match character literals 'x' up to LIMIT.
-Only matches single characters between single quotes."
+  "Match character literals 'x' up to LIMIT."
   (catch 'found
     (while (re-search-forward "'\\(.\\)'" limit t)
       (let ((matched-char (match-string 1)))
@@ -372,12 +305,10 @@ Only matches single characters between single quotes."
 ;;;; Infix backtick support
 
 (defconst monad-infix-regexp "`\\([^`\n]+\\)`"
-  "Regexp matching infix backtick expressions.
-Group 1 is the function name between the backticks.")
+  "Regexp matching infix backtick expressions.")
 
 (defun monad-infix-matcher (limit)
-  "Font-lock matcher for infix backtick expressions up to LIMIT.
-Applies initial backtick invisibility when `monad-infix-hide-backticks' is set."
+  "Font-lock matcher for infix backtick expressions up to LIMIT."
   (let (found)
     (while (and (not found)
                 (re-search-forward monad-infix-regexp limit t))
@@ -388,15 +319,11 @@ Applies initial backtick invisibility when `monad-infix-hide-backticks' is set."
         (setq found t)))
     found))
 
-(defvar-local monad-infix--idle-timer nil
-  "Idle timer for refreshing infix backtick visibility.")
-
-(defvar-local monad-infix--updating nil
-  "Guard flag to prevent recursive updates.")
+(defvar-local monad-infix--idle-timer nil)
+(defvar-local monad-infix--updating nil)
 
 (defun monad-infix--refresh-visibility ()
-  "Refresh backtick visibility around point.
-Scans only a few lines around point; safe to call from a timer."
+  "Refresh backtick visibility around point."
   (when (and (derived-mode-p 'monad-mode)
              (not monad-infix--updating))
     (let ((monad-infix--updating t)
@@ -423,9 +350,7 @@ Scans only a few lines around point; safe to call from a timer."
 ;;;; Electric pair for backtick
 
 (defun monad--setup-electric-pair ()
-  "Setup electric pairing of backticks in monad-mode.
-Adds `` (` . `) `` to `electric-pair-pairs' so typing one backtick
-inserts a matching one, enabling `fun` infix syntax."
+  "Setup electric pairing of backticks in monad-mode."
   (when (bound-and-true-p electric-pair-mode)
     (setq-local electric-pair-pairs
                 (append electric-pair-pairs '((?` . ?`))))
@@ -435,8 +360,7 @@ inserts a matching one, enabling `fun` infix syntax."
 ;; Assembly syntax highlighting support
 
 (defun monad-syntax-propertize (start end)
-  "Apply syntax properties from START to END.
-Marks asm form regions and keeps semicolon comments working."
+  "Apply syntax properties from START to END."
   (goto-char start)
   (funcall
    (syntax-propertize-rules
@@ -479,31 +403,22 @@ Marks asm form regions and keeps semicolon comments working."
   (get-text-property (or pos (point)) 'monad-asm-region))
 
 (defun monad-asm-indent-line ()
-  "Indent the current line in an asm block.
-Labels (word followed by :) are flushed to column 0.
-All other lines align to the column of the first instruction token
-after the `asm' keyword on the opening line, giving:
-  (asm rdtsc
-       shl 32   %rdx
-       or  %rdx %rax))"
+  "Indent the current line in an asm block."
   (interactive)
   (let* ((savep (point))
          (target-col
           (save-excursion
-            ;; Walk back to find the `(asm' opening
             (condition-case nil
                 (progn
                   (re-search-backward "(\\s-*asm\\_>" nil t)
-                  (goto-char (match-end 0))   ; past `asm'
-                  (skip-chars-forward " \t")  ; skip spaces after `asm'
-                  ;; If there is a first instruction on the same line, align to it
+                  (goto-char (match-end 0))
+                  (skip-chars-forward " \t")
                   (if (not (eolp))
                       (current-column)
-                    ;; Otherwise fall back to (asm-keyword-col + 5)
                     (+ (progn (goto-char (match-beginning 0))
                               (current-column))
                        5)))
-              (error 7)))))  ; safe fallback column
+              (error 7)))))
     (save-excursion
       (beginning-of-line)
       (skip-chars-forward " \t")
@@ -515,8 +430,7 @@ after the `asm' keyword on the opening line, giving:
       (back-to-indentation))))
 
 (defun monad-indent-line ()
-  "Indent current line.
-Uses asm-specific indentation inside asm blocks, lisp indentation outside."
+  "Indent current line."
   (interactive)
   (if (monad-in-asm-form-p)
       (monad-asm-indent-line)
@@ -549,8 +463,7 @@ Uses asm-specific indentation inside asm blocks, lisp indentation outside."
         (font-lock-fontify-region (point) line-end)))))
 
 (defun monad-syntactic-face-function (state)
-  "Determine face for syntax at STATE.
-Disables comment/string highlighting inside asm forms."
+  "Determine face for syntax at STATE."
   (unless (monad-in-asm-form-p)
     (lisp-font-lock-syntactic-face-function state)))
 
@@ -579,7 +492,7 @@ Disables comment/string highlighting inside asm forms."
     "rep" "repe" "repz" "repne" "repnz"
     ;; ARM
     "swi")
-  "Assembly instructions — shared by font-lock highlighting and completion.")
+  "Assembly instructions.")
 
 (defconst monad-asm-registers
   '("%rax" "%rbx" "%rcx" "%rdx" "%rsi" "%rdi" "%rbp" "%rsp"
@@ -591,13 +504,12 @@ Disables comment/string highlighting inside asm forms."
     ;; ARM
     "r0" "r1" "r2" "r3" "r4" "r5" "r6" "r7"
     "r8" "r9" "r10" "r11" "r12" "sp" "lr" "pc")
-  "Assembly registers — shared by font-lock highlighting and completion.")
+  "Assembly registers.")
 
-(defvar monad-asm-font-lock-keywords-cache nil
-  "Cached assembly font-lock keywords for performance.")
+(defvar monad-asm-font-lock-keywords-cache nil)
 
 (defun monad-asm-get-font-lock-keywords ()
-  "Get assembly font-lock keywords, reusing `monad-asm-instructions'."
+  "Get assembly font-lock keywords."
   (or monad-asm-font-lock-keywords-cache
       (setq monad-asm-font-lock-keywords-cache
             (if (and (boundp 'asm-font-lock-keywords)
@@ -606,10 +518,8 @@ Disables comment/string highlighting inside asm forms."
               (list
                '(";.*$" . font-lock-comment-face)
                '("^\\s-*\\([.a-zA-Z_][a-zA-Z0-9_]*\\):" 1 font-lock-function-name-face)
-               ;; Instructions — reuse the shared constant
                (cons (regexp-opt monad-asm-instructions 'symbols)
                      'font-lock-keyword-face)
-               ;; Registers — reuse the shared constant (strip % for the regexp)
                (cons (regexp-opt monad-asm-registers)
                      'font-lock-variable-name-face)
                '("\\.[a-zA-Z_][a-zA-Z0-9_]*" . font-lock-builtin-face)
@@ -621,42 +531,28 @@ Disables comment/string highlighting inside asm forms."
   "Return font-lock keywords for Monad mode."
   (append
    (list
-    ;; Infix backtick expressions — must come first so they take priority.
     (list 'monad-infix-matcher
           '(0 'monad-infix-face t)
           '(1 'monad-infix-face t))
-    ;; Asm keyword itself
     '("(\\s-*\\(asm\\)\\_>" 1 font-lock-keyword-face)
-    ;; Keywords (but not 'asm' since it's handled above)
     (cons (regexp-opt (remove "asm" monad-keywords) 'symbols)
           'font-lock-keyword-face)
-    ;; Type annotation operator ::
     '("::" . font-lock-builtin-face)
-    ;; Special :keywords (symbols starting with :)
     '(":\\sw+" . font-lock-builtin-face)
-    ;; Character literals 'x' (exactly one character)
     '(monad-char-literal-matcher . font-lock-string-face)
-    ;; Underscore wildcard
     '("\\<_\\>" . 'shadow)
-    ;; #+ by itself
     '("#\\+\\>" . 'shadow)
-    ;; #+ with feature name
     '("\\(#\\+\\)\\(\\sw+\\)"
       (1 'shadow t)
       (2 font-lock-function-name-face t))
-    ;; #- with feature name
     '("#-\\sw+" . 'shadow)
-    ;; #--- style separators
     '("#-+\\>" . 'shadow)
-    ;; Function definitions: (define (name ...) ...)
     '("(\\(define\\)\\s-+(\\(\\(?:\\sw\\|\\s_\\)+\\)"
       (1 font-lock-keyword-face)
       (2 font-lock-function-name-face))
-    ;; Variable definitions: (define name ...) and (define [name :: Type] ...)
     '("(\\(define\\)\\s-+\\[?\\(\\(?:\\sw\\|\\s_\\)+\\)"
       (1 font-lock-keyword-face)
       (2 font-lock-variable-name-face)))
-   ;; Assembly syntax inside asm forms
    (let ((asm-keywords (monad-asm-get-font-lock-keywords)))
      (mapcar (lambda (keyword)
                (let* ((matcher (if (consp keyword) (car keyword) keyword))
@@ -685,11 +581,10 @@ Disables comment/string highlighting inside asm forms."
                       found))
                   (list subexp face nil t))))
              asm-keywords))
-   ;; Conditionally add arrow highlighting
    (when monad-highlight-arrow
      '(("->" . font-lock-keyword-face)))))
 
-;; Set up docstring detection like Scheme does
+;; Set up docstring detection
 (put 'lambda 'monad-doc-string-elt 2)
 (put 'define 'monad-doc-string-elt
      (lambda ()
@@ -711,39 +606,95 @@ Disables comment/string highlighting inside asm forms."
 ;;;; ─────────────────────────────────────────────────────────────────────────
 ;;;; Eldoc integration
 ;;;;
-;;;; Cases:
-;;;;   1. Function: (define (name [p :: T] -> [q :: T] -> RetT) ...)
-;;;;      → minibuffer shows: (name [p :: T] -> [q :: T] -> RetT)
-;;;;   2. Typed variable: (define [name :: T] value)
-;;;;      → minibuffer shows: [name :: T] value
-;;;;   3. Plain variable: (define name value)
-;;;;      → minibuffer shows: value
+;;;; - No eldoc when the cursor is immediately after (touching) a symbol.
+;;;;   "After a symbol" means: the char before point is a word/symbol
+;;;;   constituent AND point is NOT preceded by whitespace or an open paren.
+;;;;   In practice: `x|' → silent; `(f |' → show f's signature.
+;;;;
+;;;; - When inside a function call `(fn arg1 arg2 ...)' the current parameter
+;;;;   (zero-based index among the arguments) is highlighted with
+;;;;   font-lock-variable-name-face; all other parameter names use the
+;;;;   default face — matching emacs-lisp-mode behaviour.
 ;;;; ─────────────────────────────────────────────────────────────────────────
 
+(defun monad--point-after-symbol-p ()
+  "Return non-nil when point is immediately after a symbol/word token.
+Suppresses eldoc for `x|' (cursor at the trailing edge of a token)."
+  (and (> (point) (point-min))
+       (memq (char-syntax (char-before)) '(?w ?_))))
+
+(defun monad--point-on-argument-symbol-p ()
+  "Return non-nil when point is anywhere ON a symbol in argument position.
+Covers single-char tokens, start-of-token, and interior-of-token.
+Uses the nearest enclosing PAREN (not bracket) to find the call head."
+  (when-let* ((sym (symbol-at-point)))
+    (let* ((sym-start (save-excursion
+                        (skip-syntax-backward "w_") (point)))
+           ;; Walk up paren levels until we find a `(' (not `[')
+           (fn-end (save-excursion
+                     (condition-case nil
+                         (progn
+                           (let ((found nil))
+                             (while (not found)
+                               (up-list -1)
+                               (when (eq (char-after) ?\()
+                                 (setq found t)))
+                             (forward-char 1)
+                             (skip-chars-forward "
+")
+                             (skip-syntax-forward "w_")
+                             (point)))
+                       (error nil)))))
+      (and fn-end (> sym-start fn-end)))))
+
+(defun monad--point-in-define-annotation-p ()
+  "Return non-nil when point is inside a typed `define' annotation bracket.
+Matches `(define [name :: Type] value)' -- point is anywhere inside the [...].
+Returns non-nil (the bracket start position) when the condition holds, nil otherwise."
+  (save-excursion
+    (condition-case nil
+        (progn
+          (up-list -1)                        ; go up into enclosing [...]
+          (when (eq (char-after) ?\[)
+            (up-list -1)                      ; go up into enclosing (define ...)
+            (when (eq (char-after) ?\()
+              (forward-char 1)
+              (skip-chars-forward "
+")
+              (when (looking-at "define\_>")
+                t))))                         ; confirmed: inside (define [...])
+      (error nil))))
+
+(defun monad--point-is-function-name-in-call-p ()
+  "Return non-nil when point is ON the function-name token of a call form.
+Example: in `(multo x y)', if point is anywhere inside `multo', returns t.
+Requires the enclosing delimiter to be `(' -- bracket-enclosed symbols like
+`i' in `[i :: Int]' are NOT considered function names."
+  (save-excursion
+    (condition-case nil
+        (let ((orig-start
+               (progn (skip-syntax-forward "w_")
+                      (skip-syntax-backward "w_")
+                      (point))))
+          (up-list -1)
+          ;; Must be a paren, not a bracket -- [i :: Int] is not a call form.
+          (when (eq (char-after) ?\()
+            (forward-char 1)
+            (skip-chars-forward "
+")
+            (= (point) orig-start)))
+      (error nil))))
+
 (defun monad--depth-face (depth)
-  "Return the rainbow-delimiters face for DEPTH.
-Outermost delimiter (depth 1) maps to `rainbow-delimiters-depth-2-face',
-next level to depth-3, etc., so the signature colors align with the
-buffer's own rainbow-delimiters coloring convention."
+  "Return the rainbow-delimiters face for DEPTH."
   (intern (format "rainbow-delimiters-depth-%d-face"
                   (max 1 (min 9 (1+ depth))))))
 
 (defun monad--propertize-signature (sig)
-  "Return SIG as a propertized string with syntax colours.
-Delimiter faces are assigned by actual nesting depth (depth 1 = outermost),
-using `rainbow-delimiters-depth-N-face'.  Both () and [] contribute to the
-depth counter so the correct face is always nesting-relative.
-
-Other faces:
-  ::  operator       → `font-lock-builtin-face'
-  Function name      → `font-lock-function-name-face'
-  Parameter names    → `font-lock-variable-name-face'
-
-All faces are applied with append=t (most-recently-added wins), so
-specific semantic faces always override the base delimiter colour."
+  "Return SIG as a propertized string with syntax colours."
   (let ((s (copy-sequence sig))
         (depth 0))
-    ;; ── Delimiters first (base layer) ────────────────────────────────────
+    ;; Delimiters first
     (dotimes (i (length s))
       (let ((ch (aref s i)))
         (cond
@@ -753,27 +704,26 @@ specific semantic faces always override the base delimiter colour."
          ((memq ch '(?\) ?\]))
           (add-face-text-property i (1+ i) (monad--depth-face depth) t s)
           (setq depth (max 0 (1- depth)))))))
-    ;; ── :: operator (on top of delimiter colour if it coincides) ─────────
+    ;; :: operator
     (let ((i 0))
       (while (string-match "::" s i)
         (add-face-text-property (match-beginning 0) (match-end 0)
                                 'font-lock-builtin-face t s)
         (setq i (match-end 0))))
-    ;; ── Function name: first word after leading "(" ───────────────────────
+    ;; Function name
     (when (string-match "^(\\([A-Za-z_][A-Za-z0-9_'!?$%&*/+<=>.^~-]*\\)" s)
       (add-face-text-property (match-beginning 1) (match-end 1)
                               'font-lock-function-name-face t s))
-    ;; ── Variable name at top-level "[name :: ..." ─────────────────────────
-    (when (string-match "^\\[\\([A-Za-z_][A-Za-z0-9_'!?$%&*/+<=>.^~-]*\\)[ \t]*::" s)
+    ;; Variable name at top-level "[name :: ..." (typed variable, not a param list)
+    ;; Only apply when the signature is NOT a function header (no leading `(')
+    (when (and (> (length s) 0) (not (eq (aref s 0) ?\())
+               (string-match "^\\[\\([A-Za-z_][A-Za-z0-9_'!?$%&*/+<=>.^~-]*\\)[ \t]*::" s))
       (add-face-text-property (match-beginning 1) (match-end 1)
                               'font-lock-variable-name-face t s))
-    ;; ── Parameter names inside [...] blocks ──────────────────────────────
-    (let ((i 0))
-      (while (string-match "\\[\\([a-z_][A-Za-z0-9_']*\\)[ \t]*::" s i)
-        (add-face-text-property (match-beginning 1) (match-end 1)
-                                'font-lock-variable-name-face t s)
-        (setq i (match-end 0))))
-    ;; ── String literals "..." ─────────────────────────────────────────────
+    ;; Parameter names inside [...] are intentionally NOT colored here.
+    ;; monad--propertize-signature-with-active-param handles them with
+    ;; per-slot highlighting (active = variable-name-face, others = default).
+    ;; String literals
     (let ((i 0) (len (length s)))
       (while (< i len)
         (if (eq (aref s i) ?\")
@@ -786,7 +736,7 @@ specific semantic faces always override the base delimiter colour."
               (when (< i len) (setq i (1+ i)))
               (add-face-text-property start i 'font-lock-string-face t s))
           (setq i (1+ i)))))
-    ;; ── Character literals 'x' ───────────────────────────────────────────
+    ;; Character literals
     (let ((i 0))
       (while (string-match "'\\(.\\)'" s i)
         (add-face-text-property (match-beginning 0) (match-end 0)
@@ -794,9 +744,99 @@ specific semantic faces always override the base delimiter colour."
         (setq i (match-end 0))))
     s))
 
+;;;; ── Parameter extraction ─────────────────────────────────────────────────
+
+(defun monad--parse-param-names (header-str)
+  "Parse parameter names from a function HEADER-STR like \"(fn [x :: T] -> [y :: T] -> R)\".
+Returns a list of parameter name strings in order.
+Only names inside [name :: ...] blocks are collected; the return type
+and the function name itself are ignored."
+  (let (params (i 0))
+    (while (string-match "\\[\\([a-z_][A-Za-z0-9_']*\\)[ \t]*::" header-str i)
+      (push (match-string-no-properties 1 header-str) params)
+      (setq i (match-end 0)))
+    (nreverse params)))
+
+(defun monad--current-arg-index ()
+  "Return the zero-based index of the argument position at point.
+Returns nil when point is not inside a function application form.
+The index is the number of complete sexps between the function position
+and point (i.e. 0 means we haven't typed any argument yet, 1 means we
+are past the first argument, etc.)."
+  (save-excursion
+    (condition-case nil
+        (let ((orig (point)))
+          (up-list -1)
+          (forward-char 1)
+          (skip-chars-forward " \t\n")
+          ;; Skip the function name; if it fails, signal so outer handler returns nil
+          (condition-case nil
+              (forward-sexp 1)
+            (error (error "skip-fn-failed")))
+          ;; Count argument sexps between function name and orig
+          (catch 'monad--arg-done
+            (let ((idx 0))
+              (while (and (< (point) orig) (not (eobp)))
+                (skip-chars-forward " \t\n")
+                (when (>= (point) orig)
+                  (throw 'monad--arg-done idx))
+                (condition-case nil
+                    (progn
+                      (forward-sexp 1)
+                      (when (<= (point) orig)
+                        (setq idx (1+ idx))))
+                  (error (throw 'monad--arg-done idx))))
+              idx)))
+      (error nil))))
+
+;;;; ── Propertize signature with active-parameter highlighting ──────────────
+
+(defun monad--propertize-signature-with-active-param (sig active-idx)
+  "Return SIG propertized with ACTIVE-IDX parameter highlighted.
+ACTIVE-IDX is zero-based.  Pass -1 to put ALL param names in default face
+(used when hovering the function name itself — no slot is being filled)."
+  (let ((s (monad--propertize-signature sig))
+        (param-spans '())
+        (i 0))
+    (while (string-match "\\[\\([a-z_][A-Za-z0-9_']*\\)[ \t]*::" sig i)
+      (push (cons (match-beginning 1) (match-end 1)) param-spans)
+      (setq i (match-end 0)))
+    (setq param-spans (nreverse param-spans))
+    (cl-loop for span in param-spans
+             for param-idx from 0
+             do (let ((b (car span))
+                      (e (cdr span)))
+                  (if (and (>= active-idx 0) (= param-idx active-idx))
+                      (add-face-text-property b e 'font-lock-variable-name-face nil s)
+                    (add-face-text-property b e 'default nil s))))
+    s))
+
+;;;; ── Context detection: are we in a function call? ───────────────────────
+
+(defun monad--enclosing-call-function-name ()
+  "Return the name of the function being called in the enclosing sexp, or nil.
+Returns nil when point is at the function-name position itself (i.e. arg-idx=0
+would mean we haven't started arguments yet and we ARE the function name).
+Only returns a name when we are inside the argument list of a call."
+  (save-excursion
+    (condition-case nil
+        (progn
+          (up-list -1)
+          (forward-char 1)
+          (skip-chars-forward " \t\n")
+          ;; Read what's at the function position
+          (when (looking-at "\\(?:\\sw\\|\\s_\\)+")
+            (let ((fn-name (match-string-no-properties 0))
+                  (fn-end  (match-end 0)))
+              ;; Make sure point (before up-list) was PAST the function name
+              ;; i.e. we are in the argument portion of the form, not on the fn itself
+              fn-name)))
+      (error nil))))
+
+;;;; ── Main eldoc function ──────────────────────────────────────────────────
+
 (defun monad--extract-function-header (name)
-  "Return \"(NAME [p :: T] -> ... -> RetT)\" for function NAME, or nil.
-Searches for `(define (NAME ...)' and extracts the header sexp."
+  "Return the header sexp string for function NAME, or nil."
   (save-excursion
     (goto-char (point-min))
     (let ((rx (concat "^(define[ \t\n]+(\\("
@@ -815,20 +855,9 @@ Searches for `(define (NAME ...)' and extracts the header sexp."
           (error nil))))))
 
 (defun monad--extract-variable-info (name)
-  "Return eldoc string for a variable NAME, or nil.
-
-Handles these forms (value is always the first sexp after the name/annotation):
-  (define [name :: Type] value)         -> \"[name :: Type] value\"
-  (define [name :: Type] value \"doc\") -> \"[name :: Type] value\"
-  (define name value)                   -> \"value\"
-  (define name value \"doc\")           -> \"value\"
-
-The docstring, when present, always comes AFTER the value sexp, so we
-simply extract the first sexp following the name as the value and stop.
-This works correctly for strings, chars, numbers, and compound expressions."
+  "Return eldoc string for a variable NAME, or nil."
   (save-excursion
     (goto-char (point-min))
-    ;; ── Typed form: (define [name :: Type] value) ────────────────────────
     (let ((typed-rx (concat "^(define[ \t\n]+\\(\\["
                             (regexp-quote name)
                             "[ \t]*::[^]\n]+\\]\\)")))
@@ -838,52 +867,40 @@ This works correctly for strings, chars, numbers, and compound expressions."
             (condition-case nil
                 (let ((val-start (point)))
                   (forward-sexp 1)
-                  ;; Always show the value -- it is never a docstring in typed forms.
                   (concat annotation " "
                           (string-trim
                            (buffer-substring-no-properties val-start (point)))))
               (error nil)))
-        ;; ── Plain form: (define name value) ─────────────────────────────
         (goto-char (point-min))
         (let ((plain-rx (concat "^(define[ \t\n]+"
                                 (regexp-quote name)
                                 "\\b")))
           (when (re-search-forward plain-rx nil t)
-            ;; Skip function definitions: (define (name ...)  ...)
             (unless (string-match-p "(define[ \t\n]+(" (match-string 0))
               (skip-chars-forward " \t\n")
               (condition-case nil
                   (let ((val-start (point)))
                     (forward-sexp 1)
-                    ;; The first sexp is always the value; docstrings follow after.
                     (string-trim
                      (buffer-substring-no-properties val-start (point))))
                 (error nil)))))))))
 
-
 (defun monad--extract-enclosing-param-type (name)
-  "Return \"[NAME :: Type]\" if NAME is a typed parameter of the enclosing function.
-Searches the header `(define (fn ... [NAME :: Type] ...))' of the function
-whose body contains point.  Returns nil if NAME is not found as a parameter
-or if it has no type annotation."
+  "Return \"[NAME :: Type]\" if NAME is a typed parameter of the enclosing function."
   (save-excursion
     (condition-case nil
         (progn
           (beginning-of-defun)
-          ;; Must be a function define: (define (fn ...)  ...)
           (when (looking-at "(define[ \t\n]*(")
-            (down-list 1)       ; step inside outer (
-            (forward-sexp 1)    ; skip "define"
+            (down-list 1)
+            (forward-sexp 1)
             (skip-chars-forward " \t\n")
-            ;; Now at the header sexp: (fn [x :: T] -> ...)
             (when (eq (char-after) ?\()
               (let ((hdr-start (point)))
                 (forward-sexp 1)
-                (let ((hdr-end (point))
-                      (hdr-str (buffer-substring-no-properties
-                                (1+ hdr-start)  ; skip opening (
-                                (1- (point))))) ; skip closing )
-                  ;; Scan hdr-str for [NAME :: Type]
+                (let ((hdr-str (buffer-substring-no-properties
+                                (1+ hdr-start)
+                                (1- (point)))))
                   (with-temp-buffer
                     (insert hdr-str)
                     (goto-char (point-min))
@@ -894,27 +911,22 @@ or if it has no type annotation."
       (error nil))))
 
 (defun monad--eldoc-from-module-file (file bare-name)
-  "Return an eldoc string for BARE-NAME found in FILE, or nil.
-Searches FILE for a function header or variable definition matching BARE-NAME."
+  "Return an eldoc string for BARE-NAME found in FILE, or nil."
   (when (and file (file-readable-p file))
     (with-current-buffer (find-file-noselect file)
       (or (monad--extract-function-header bare-name)
           (monad--extract-variable-info   bare-name)))))
 
 (defun monad--eldoc-from-imports (name)
-  "Return a raw (unpropertized) eldoc string for NAME found in any imported module.
-Handles both bare names and qualified `Module.name' forms."
+  "Return a raw eldoc string for NAME found in any imported module."
   (let* ((imports (monad--parse-imports))
-         ;; Split qualified name, e.g. "Math.add" -> mod="Math", bare="add"
          (qualified-p (string-match "^\\([A-Z][^.]*\\)\\.\\(.+\\)$" name))
          (mod-name    (and qualified-p (match-string 1 name)))
          (bare        (if qualified-p (match-string 2 name) name))
          result)
     (if qualified-p
-        ;; Qualified: look only in that specific module
         (let ((file (monad--module-file mod-name)))
           (setq result (monad--eldoc-from-module-file file bare)))
-      ;; Unqualified: search all non-qualified imports in order
       (cl-dolist (entry imports)
         (let* ((plist     (cdr entry))
                (qualified (plist-get plist :qualified))
@@ -925,36 +937,84 @@ Handles both bare names and qualified `Module.name' forms."
               (cl-return))))))
     result))
 
+(defun monad--hover-doc (name)
+  "Return a propertized eldoc string for NAME as a hover (no param highlight).
+Checks enclosing-param annotation, then function header, then variable info,
+then imports.  Returns nil if nothing is found."
+  (or
+   (when-let* ((ann (monad--extract-enclosing-param-type name)))
+     (monad--propertize-signature ann))
+   (when-let* ((hdr (monad--extract-function-header name)))
+     (monad--propertize-signature hdr))
+   (when-let* ((info (monad--extract-variable-info name)))
+     (monad--propertize-signature info))
+   (when-let* ((info (monad--eldoc-from-imports name)))
+     (monad--propertize-signature info))))
+
+(defun monad--call-signature (fn-name arg-idx)
+  "Return a propertized signature for FN-NAME with ARG-IDX highlighted.
+When ARG-IDX is -1 no parameter is highlighted (all use default face)."
+  (let ((hdr (or (monad--extract-function-header fn-name)
+                 (monad--eldoc-from-imports fn-name))))
+    (when hdr
+      (monad--propertize-signature-with-active-param hdr arg-idx))))
+
 (defun monad--eldoc-get-doc ()
-  "Return a propertized eldoc string for the symbol at point, or nil.
-Priority:
-  1. NAME is a typed parameter of the enclosing function  → [NAME :: Type]
-  2. NAME names a function definition in this buffer      → (NAME header)
-  3. NAME names a typed/plain variable in this buffer     → annotation + value
-  4. NAME (bare or Module.name) found in an imported file → header or value"
-  (when-let* ((sym  (symbol-at-point))
-              (name (symbol-name sym)))
-    (or
-     ;; 1. Parameter of enclosing function (highest priority)
-     (when-let* ((ann (monad--extract-enclosing-param-type name)))
-       (monad--propertize-signature ann))
-     ;; 2. Function header in this buffer
-     (when-let* ((hdr (monad--extract-function-header name)))
-       (monad--propertize-signature hdr))
-     ;; 3. Variable in this buffer
-     (when-let* ((info (monad--extract-variable-info name)))
-       (monad--propertize-signature info))
-     ;; 4. Imported module symbol (bare or qualified)
-     (when-let* ((info (monad--eldoc-from-imports name)))
-       (monad--propertize-signature info)))))
+  "Return a propertized eldoc string for the current context, or nil.
+
+Priority rules:
+  1. Trailing edge of a symbol and NOT on an argument symbol => nil (silent).
+  2. Point ON the function-name token of a call => signature, all params dimmed.
+  3. Point ON an argument symbol => hover: show that symbol type/value.
+  4. Point in a gap inside a call => signature with current param highlighted.
+  5. Fallback: hover over any symbol at point."
+  (let* ((sym      (symbol-at-point))
+         (sym-name (and sym (symbol-name sym))))
+    (cond
+     ;; Rule 1: trailing edge, not sitting on an argument token -> silent,
+     ;; UNLESS we are not inside any call at all (top-level hover is always ok).
+     ((and (monad--point-after-symbol-p)
+           (not (monad--point-on-argument-symbol-p))
+           (not (monad--point-is-function-name-in-call-p))
+           ;; Still show hover when there is no enclosing call context at all
+           ;; (e.g. hovering `i' at the end of `(define [i :: Int] 20)').
+           (monad--current-arg-index))
+      nil)
+
+     ;; Rule 2: cursor ON the function-name token -> show signature, all params dimmed.
+     ((monad--point-is-function-name-in-call-p)
+      (when sym-name
+        (monad--call-signature sym-name -1)))
+
+     ;; Rule 2.5: cursor inside a `(define [name :: Type] ...)' annotation bracket.
+     ;; Show the variable's own type+value via hover, not a call signature.
+     ((monad--point-in-define-annotation-p)
+      (when sym-name
+        (monad--hover-doc sym-name)))
+
+     ;; Rule 3: cursor ON a written argument symbol -> hover for that symbol.
+     ((monad--point-on-argument-symbol-p)
+      (when sym-name
+        (or (monad--hover-doc sym-name)
+            ;; Symbol has no definition info; fall back to call signature.
+            (let ((arg-idx (monad--current-arg-index))
+                  (fn-name (monad--enclosing-call-function-name)))
+              (when (and fn-name arg-idx)
+                (monad--call-signature fn-name arg-idx))))))
+
+     ;; Rule 4: gap inside a call -> highlighted parameter signature.
+     (t
+      (let* ((arg-idx (monad--current-arg-index))
+             (fn-name (when arg-idx (monad--enclosing-call-function-name))))
+        (or
+         (when (and fn-name arg-idx)
+           (monad--call-signature fn-name arg-idx))
+         ;; Rule 5: outside any call form, generic hover.
+         (when sym-name
+           (monad--hover-doc sym-name))))))))
 
 (defun monad-eldoc-function (callback &rest _ignored)
-  "Eldoc documentation function for Monad mode.
-Registered on `eldoc-documentation-functions' (Emacs 28+).
-Calls CALLBACK with the propertized signature string and returns t,
-or returns nil when there is nothing to show.
-We never return the doc string itself — that would cause eldoc's
-dispatch loop to display it a second time via the return value."
+  "Eldoc documentation function for Monad mode."
   (when-let* ((doc (monad--eldoc-get-doc)))
     (funcall callback doc)
     t))
@@ -983,20 +1043,15 @@ dispatch loop to display it a second time via the return value."
   (setq-local imenu-case-fold-search t)
   (setq-local imenu-create-index-function #'monad--imenu-build-index)
   (setq-local imenu-syntax-alist '(("+-*/.<>=?!$%_&~^:" . "w")))
-  ;; Annotation function for consult-imenu and built-in completion
   (setq-local completion-extra-properties
               (list :annotation-function #'monad-imenu-annotate))
-  ;; Marginalia integration (mirrors nytrix-mode)
   (with-eval-after-load 'marginalia
     (add-to-list 'marginalia-annotators
                  '(imenu monad-imenu-annotate builtin none)))
-  ;; Invalidate the docstring cache whenever the buffer changes
   (add-hook 'after-change-functions
             (lambda (&rest _) (monad--invalidate-docstring-cache))
             nil t)
-  ;; Set up syntax-propertize
   (setq-local syntax-propertize-function #'monad-syntax-propertize)
-  ;; Set up font-lock extension for asm forms
   (setq-local font-lock-extend-region-functions
               (list #'monad-font-lock-extend-region
                     #'font-lock-extend-region-wholelines
@@ -1009,35 +1064,17 @@ dispatch loop to display it a second time via the return value."
           (font-lock-syntactic-face-function
            . monad-syntactic-face-function)))
   (setq-local lisp-doc-string-elt-property 'monad-doc-string-elt)
-  ;; Xref backend
   (add-hook 'xref-backend-functions #'monad-xref-backend nil t)
-  ;; Completion-at-point (works with Corfu, company, built-in)
   (add-hook 'completion-at-point-functions #'monad-completion-at-point nil t)
-  ;; Asm fontification on self-insert
   (add-hook 'post-self-insert-hook #'monad-post-self-insert nil t)
-  ;; Infix backtick visibility
   (add-hook 'post-command-hook #'monad-infix-schedule-refresh nil t)
-  ;; Electric pair for backtick
   (monad--setup-electric-pair)
-  ;; ── Rainbow delimiters ─────────────────────────────────────────────────
-  ;; Enable for the buffer so delimiters in source are colored by nesting depth.
-  ;; The eldoc propertize function uses the same rainbow-delimiters-depth-N-face
-  ;; faces so minibuffer signatures match the editor colors.
   (rainbow-delimiters-mode 1)
-  ;; ── Eldoc ──────────────────────────────────────────────────────────────
-  ;; Turn eldoc on first (prog-mode may or may not have done so already),
-  ;; then *replace* the whole documentation-functions list so that any
-  ;; backend eldoc-mode itself appended (e.g. lisp-eldoc-function,
-  ;; elisp-eldoc-documentation-function) is evicted.  Doing this after
-  ;; `eldoc-mode 1' is the only reliable order because eldoc populates the
-  ;; list during its activation hook.
   (eldoc-mode 1)
   (setq-local eldoc-documentation-functions '(monad-eldoc-function))
-  ;; Use the simple "eager" strategy: call every function, show first result.
-  ;; This prevents eldoc from merging multiple results into one message.
   (setq-local eldoc-documentation-strategy #'eldoc-documentation-default))
 
-;;;; Module system — parsing imports and collecting symbols
+;;;; Module system
 
 (defun monad--current-file-dir ()
   "Return the directory of the current buffer's file, or nil."
@@ -1045,27 +1082,36 @@ dispatch loop to display it a second time via the return value."
     (file-name-directory buffer-file-name)))
 
 (defun monad--module-file (module-name)
-  "Return the path to MODULE-NAME's .mon file relative to the current buffer.
-E.g. \"Math\" -> \"/path/to/current/Math.mon\"."
+  "Return the path to MODULE-NAME's .mon file relative to the current buffer."
   (when-let* ((dir (monad--current-file-dir)))
     (expand-file-name (concat module-name ".mon") dir)))
 
 (defun monad--parse-exports (file)
-  "Return the list of exported symbol names from FILE as propertized strings."
+  "Return the list of exported symbol names from FILE.
+Each symbol is propertized with the correct `company-kind': `function' or
+`variable', determined by inspecting the actual definitions in FILE."
   (when (and file (file-readable-p file))
     (with-temp-buffer
       (insert-file-contents file)
       (goto-char (point-min))
       (if (re-search-forward
            "^(module\\s-+\\(?:\\sw\\|\\s_\\)+\\s-+\\[\\([^]]*\\)\\]" nil t)
-          (mapcar (lambda (s) (propertize s 'company-kind 'function))
-                  (split-string (match-string-no-properties 1) "[ \t\n]+" t))
+          (let* ((export-names (split-string (match-string-no-properties 1)
+                                             "[ \t\n]+" t))
+                 ;; Build a kind-lookup table from the actual definitions in this file.
+                 (defines (monad--collect-defines))
+                 (kind-table (make-hash-table :test #'equal)))
+            (dolist (d defines)
+              (puthash d (get-text-property 0 'company-kind d) kind-table))
+            (mapcar (lambda (s)
+                      (propertize s 'company-kind
+                                  (or (gethash s kind-table) 'function)))
+                    export-names))
+        ;; No explicit export list -- return all defines with their real kinds.
         (monad--collect-defines)))))
 
 (defun monad--collect-defines ()
-  "Collect all top-level define names in the current buffer.
-Returns propertized strings with `company-kind' set to
-`function' or `variable'."
+  "Collect all top-level define names in the current buffer."
   (let (names)
     (save-excursion
       (goto-char (point-min))
@@ -1111,7 +1157,7 @@ Returns propertized strings with `company-kind' set to
     (nreverse imports)))
 
 (defun monad--import-completions (imports)
-  "Return completion candidates derived from IMPORTS with `company-kind' properties."
+  "Return completion candidates derived from IMPORTS."
   (let (candidates)
     (dolist (entry imports)
       (let* ((modname   (car entry))
@@ -1152,7 +1198,7 @@ Returns propertized strings with `company-kind' set to
     (monad--collect-defines))))
 
 (defun monad--asm-candidates ()
-  "Return asm completion candidates for use inside (asm ...) blocks."
+  "Return asm completion candidates."
   (delete-dups
    (append
     (mapcar (lambda (i) (propertize i 'company-kind 'monad-asm))
@@ -1162,18 +1208,18 @@ Returns propertized strings with `company-kind' set to
     (monad--collect-defines))))
 
 (defun monad--keyword-candidates ()
-  "Return monad keywords as propertized candidates with `company-kind' = `keyword'."
+  "Return monad keywords as propertized candidates."
   (mapcar (lambda (kw) (propertize kw 'company-kind 'keyword))
           monad-keywords))
 
 (defun monad--all-completions ()
-  "Return all Monad completion candidates (not for asm context)."
+  "Return all Monad completion candidates."
   (delete-dups
    (append (monad--keyword-candidates)
            (monad--collect-defines)
            (monad--import-completions (monad--parse-imports)))))
 
-;;;; Completion-at-point (Corfu / built-in)
+;;;; Completion-at-point
 
 (defun monad--kind-function (candidates)
   "Return a `company-kind' function over CANDIDATES."
@@ -1214,9 +1260,6 @@ Returns propertized strings with `company-kind' set to
           :company-kind kind-fn
           :annotation-function
           (lambda (cand)
-            ;; Like elisp-mode's " <f>" annotation, show a short type
-            ;; signature for functions and typed variables, falling back
-            ;; to a kind tag for keywords and asm instructions.
             (pcase (funcall kind-fn cand)
               ('function
                (if-let* ((hdr (monad--extract-function-header cand)))
@@ -1237,7 +1280,7 @@ Returns propertized strings with `company-kind' set to
   'monad)
 
 (cl-defmethod xref-backend-identifier-at-point ((_backend (eql monad)))
-  "Return the identifier at point, including qualified Module.sym forms."
+  "Return the identifier at point."
   (let* ((sym (symbol-at-point))
          (name (and sym (symbol-name sym))))
     (when name
@@ -1275,18 +1318,15 @@ Returns propertized strings with `company-kind' set to
   (car (monad--find-all-defines buf symbol)))
 
 (defun monad--find-parameters (symbol)
-  "Search for SYMBOL as a typed parameter in the enclosing `(define (fn ...))'.
-Returns an xref location pointing to the symbol inside the header, or nil."
+  "Search for SYMBOL as a typed parameter in the enclosing define."
   (save-excursion
     (condition-case nil
         (progn
           (beginning-of-defun)
-          ;; Must be a function define: (define (fn ...)  ...)
           (when (looking-at "(define[ \t\n]*(")
-            (down-list 1)         ; inside outer (
-            (forward-sexp 1)      ; skip "define"
+            (down-list 1)
+            (forward-sexp 1)
             (skip-chars-forward " \t\n")
-            ;; Now at the opening ( of the header sexp
             (when (eq (char-after) ?\()
               (let* ((hdr-open  (point))
                      (hdr-open1 (1+ hdr-open))
@@ -1308,7 +1348,6 @@ Returns an xref location pointing to the symbol inside the header, or nil."
                               (current-buffer) result)))))))
       (error nil))))
 
-
 (defun monad--find-in-file (file symbol)
   "Search FILE for all definitions of SYMBOL."
   (when (and file (file-readable-p file))
@@ -1319,7 +1358,7 @@ Returns an xref location pointing to the symbol inside the header, or nil."
         (monad--find-all-defines (current-buffer) bare)))))
 
 (defun monad--find-module-location (module-name)
-  "Return an xref location jumping to the module name inside its (module ...) decl."
+  "Return an xref location jumping to the module name inside its declaration."
   (when-let* ((file (monad--module-file module-name)))
     (when (file-readable-p file)
       (with-current-buffer (find-file-noselect file)
@@ -1333,7 +1372,7 @@ Returns an xref location pointing to the symbol inside the header, or nil."
                         (match-beginning 1)))))))))
 
 (cl-defmethod xref-backend-definitions ((_backend (eql monad)) symbol)
-  "Find definitions of SYMBOL — parameters first, then locals, then imports."
+  "Find definitions of SYMBOL."
   (catch 'monad-xref-done
     (let (defs)
       (when (and (string-match-p "^[A-Z]" symbol)
@@ -1359,7 +1398,7 @@ Returns an xref location pointing to the symbol inside the header, or nil."
       (nreverse defs))))
 
 (cl-defmethod xref-backend-identifier-completion-table ((_backend (eql monad)))
-  "Return all identifiers: keywords, local defines, imported symbols, module names."
+  "Return all identifiers."
   (let* ((imports (monad--parse-imports))
          (mods    (mapcar (lambda (m) (propertize (car m) 'company-kind 'module))
                           imports)))
@@ -1370,15 +1409,14 @@ Returns an xref location pointing to the symbol inside the header, or nil."
              (monad--import-completions imports)))))
 
 (defun monad--read-full-docstring-at-point ()
-  "Like `monad--read-docstring-at-point' but returns the full docstring text.
-Point must be at the opening `(' of a `(define ...)' form."
+  "Return the full docstring text for the define form at point."
   (condition-case nil
       (progn
         (down-list 1)
-        (forward-sexp 1)              ; skip "define"
+        (forward-sexp 1)
         (skip-chars-forward " \t\n")
         (let ((is-function (eq (char-after) ?\()))
-          (forward-sexp 1)            ; skip header
+          (forward-sexp 1)
           (unless is-function
             (skip-chars-forward " \t\n")
             (condition-case nil (forward-sexp 1) (error nil))))
@@ -1407,8 +1445,7 @@ Point must be at the opening `(' of a `(define ...)' form."
     (error nil)))
 
 (defun monad--full-docstring-for (name)
-  "Return the full docstring text for NAME, or nil.
-Searches the current buffer for NAME's definition form."
+  "Return the full docstring text for NAME, or nil."
   (save-excursion
     (goto-char (point-min))
     (let ((fn-rx  (concat "^(define[ \t\n]+(\\(" (regexp-quote name) "\\)\\b"))
@@ -1421,10 +1458,7 @@ Searches the current buffer for NAME's definition form."
           (monad--read-full-docstring-at-point))))))
 
 (defun monad-show-docstring ()
-  "Show the full docstring of the symbol at point in the minibuffer.
-Displays the text with `font-lock-doc-face'.  Works for both functions
-and variables (typed or plain).  Reports an error when no symbol is
-found at point or no docstring is defined for it."
+  "Show the full docstring of the symbol at point in the minibuffer."
   (interactive)
   (let* ((sym  (symbol-at-point))
          (name (and sym (symbol-name sym))))
