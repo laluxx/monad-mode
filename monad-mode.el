@@ -143,9 +143,7 @@ The backticks become visible again when point is inside the expression."
     "module" "import" "qualified" "as" "hiding" )
   "Keywords for the Monad programming language.")
 
-;;;; ─────────────────────────────────────────────────────────────────────────
-;;;; Imenu — flat index with cached docstring annotations
-;;;; ─────────────────────────────────────────────────────────────────────────
+;;; Imenu — flat index with cached docstring annotations
 
 (defvar-local monad--docstring-cache nil
   "Cache for definition docstrings.  Hash table mapping name strings to
@@ -302,7 +300,7 @@ Returns the first line of the docstring, or nil."
           (throw 'found t))))
     nil))
 
-;;;; Infix backtick support
+;;; Infix backtick support
 
 (defconst monad-infix-regexp "`\\([^`\n]+\\)`"
   "Regexp matching infix backtick expressions.")
@@ -347,7 +345,7 @@ Returns the first line of the docstring, or nil."
     (setq monad-infix--idle-timer
           (run-with-idle-timer 0.05 nil #'monad-infix--refresh-visibility))))
 
-;;;; Electric pair for backtick
+;;; Electric pair for backtick
 
 (defun monad--setup-electric-pair ()
   "Setup electric pairing of backticks in monad-mode."
@@ -603,19 +601,17 @@ Returns the first line of the docstring, or nil."
                  0))
            (error 0))))))
 
-;;;; ─────────────────────────────────────────────────────────────────────────
 ;;;; Eldoc integration
-;;;;
-;;;; - No eldoc when the cursor is immediately after (touching) a symbol.
-;;;;   "After a symbol" means: the char before point is a word/symbol
-;;;;   constituent AND point is NOT preceded by whitespace or an open paren.
-;;;;   In practice: `x|' → silent; `(f |' → show f's signature.
-;;;;
-;;;; - When inside a function call `(fn arg1 arg2 ...)' the current parameter
-;;;;   (zero-based index among the arguments) is highlighted with
-;;;;   font-lock-variable-name-face; all other parameter names use the
-;;;;   default face — matching emacs-lisp-mode behaviour.
-;;;; ─────────────────────────────────────────────────────────────────────────
+
+;; - No eldoc when the cursor is immediately after (touching) a symbol.
+;;   "After a symbol" means: the char before point is a word/symbol
+;;   constituent AND point is NOT preceded by whitespace or an open paren.
+;;   In practice: `x|' → silent; `(f |' → show f's signature.
+;;
+;; - When inside a function call `(fn arg1 arg2 ...)' the current parameter
+;;   (zero-based index among the arguments) is highlighted with
+;;   font-lock-variable-name-face; all other parameter names use the
+;;   default face — matching emacs-lisp-mode behaviour.
 
 (defun monad--point-after-symbol-p ()
   "Return non-nil when point is immediately after a symbol/word token.
@@ -744,7 +740,7 @@ Requires the enclosing delimiter to be `(' -- bracket-enclosed symbols like
         (setq i (match-end 0))))
     s))
 
-;;;; ── Parameter extraction ─────────────────────────────────────────────────
+;;;; Parameter extraction
 
 (defun monad--parse-param-names (header-str)
   "Parse parameter names from a function HEADER-STR like \"(fn [x :: T] -> [y :: T] -> R)\".
@@ -789,7 +785,7 @@ are past the first argument, etc.)."
               idx)))
       (error nil))))
 
-;;;; ── Propertize signature with active-parameter highlighting ──────────────
+;;;; Propertize signature with active-parameter highlighting
 
 (defun monad--propertize-signature-with-active-param (sig active-idx)
   "Return SIG propertized with ACTIVE-IDX parameter highlighted.
@@ -811,7 +807,7 @@ ACTIVE-IDX is zero-based.  Pass -1 to put ALL param names in default face
                     (add-face-text-property b e 'default nil s))))
     s))
 
-;;;; ── Context detection: are we in a function call? ───────────────────────
+;;;; Context detection: are we in a function call?
 
 (defun monad--enclosing-call-function-name ()
   "Return the name of the function being called in the enclosing sexp, or nil.
@@ -833,7 +829,7 @@ Only returns a name when we are inside the argument list of a call."
               fn-name)))
       (error nil))))
 
-;;;; ── Main eldoc function ──────────────────────────────────────────────────
+;;;; Main eldoc function
 
 (defun monad--extract-function-header (name)
   "Return the header sexp string for function NAME, or nil."
@@ -1019,8 +1015,6 @@ Priority rules:
     (funcall callback doc)
     t))
 
-;;;; ─────────────────────────────────────────────────────────────────────────
-
 (defun monad-mode-variables ()
   "Set up variables for Monad mode."
   (set-syntax-table monad-mode-syntax-table)
@@ -1074,7 +1068,7 @@ Priority rules:
   (setq-local eldoc-documentation-functions '(monad-eldoc-function))
   (setq-local eldoc-documentation-strategy #'eldoc-documentation-default))
 
-;;;; Module system
+;;; Module system
 
 (defun monad--current-file-dir ()
   "Return the directory of the current buffer's file, or nil."
@@ -1219,7 +1213,7 @@ Each symbol is propertized with the correct `company-kind': `function' or
            (monad--collect-defines)
            (monad--import-completions (monad--parse-imports)))))
 
-;;;; Completion-at-point
+;;; Completion-at-point
 
 (defun monad--kind-function (candidates)
   "Return a `company-kind' function over CANDIDATES."
@@ -1273,7 +1267,7 @@ Each symbol is propertized with the correct `company-kind': `function' or
               ('keyword   " <keyword>")
               (_          ""))))))
 
-;;;; Xref backend
+;;; Xref backend
 
 (defun monad-xref-backend ()
   "Monad backend for xref."
