@@ -360,6 +360,9 @@ backtick pairs like `+` 22 `*` do not bleed into each other.")
 (defvar-local monad-infix--updating nil)
 
 (defun monad-infix--refresh-visibility ()
+  "Refresh infix backtick visibility in a 6-line window around point.
+Only removes and re-applies text properties tagged with `monad-infix-invisible',
+leaving any `invisible' properties set by other modes (e.g. `porg-mode') intact."
   (when (and (derived-mode-p 'monad-mode)
              (not monad-infix--updating))
     (let ((monad-infix--updating t)
