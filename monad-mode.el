@@ -2,7 +2,7 @@
 
 ;; Author: Laluxx
 ;; Version: 0.0.6
-;; Package-Requires: ((emacs "29.1") (rainbow-delimiters "2.1.3"))
+;; Package-Requires: ((emacs "29.1") (porg "0.1.0") (rainbow-delimiters "2.1.3"))
 ;; Keywords: lisp, languages
 ;; URL: https://github.com/laluxx/monad-mode
 
@@ -84,6 +84,7 @@
 (require 'cl-lib)
 (require 'eldoc)
 (require 'xref)
+(require 'porg)
 (require 'rainbow-delimiters)
 
 (defgroup monad nil
@@ -1179,6 +1180,7 @@ Priority rules:
   (add-hook 'post-command-hook #'monad-infix-schedule-refresh nil t)
   (monad--setup-electric-pair)
   (rainbow-delimiters-mode 1)
+  (porg-mode 1)
   (eldoc-mode 1)
   (setq-local eldoc-documentation-functions '(monad-eldoc-function))
   (setq-local eldoc-documentation-strategy #'eldoc-documentation-default))
