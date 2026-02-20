@@ -3,50 +3,87 @@
 ;; Author: Laluxx
 ;; Version: 0.0.6
 ;; Package-Requires: ((emacs "29.1") (rainbow-delimiters "2.1.3"))
-;; Keywords: languages
+;; Keywords: lisp, languages
 ;; URL: https://github.com/laluxx/monad-mode
 
 ;; This file is not part of GNU Emacs.
+
+;;
 ;; This program is free software; you can redistribute it and/or modify
 ;; it under the terms of the GNU General Public License as published by
 ;; the Free Software Foundation, either version 3 of the License, or
 ;; (at your option) any later version.
+;;
 ;; This program is distributed in the hope that it will be useful,
 ;; but WITHOUT ANY WARRANTY; without even the implied warranty of
 ;; MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 ;; GNU General Public License for more details.
+;;
 ;; You should have received a copy of the GNU General Public License
 ;; along with this program.  If not, see <https://www.gnu.org/licenses/>.
+;;
 
 ;;; Commentary:
 
-;; This package provides a major mode for editing Monad programming language.
-;; Monad is a Lisp-like language with Scheme-like syntax and advanced
-;; type system features.
+;; Monad is a Lisp-like language with Scheme-like syntax and an advanced
+;; type system.  This package provides a major mode for editing Monad source
+;; files (*.mon).
 ;;
 ;; Features:
-;; - Syntax highlighting for keywords, strings, characters, and comments
-;; - Docstring recognition for functions, variables and lambdas
-;; - Underscore (_) shadow face for pattern matching wildcards
-;; - Scheme-compatible indentation
-;; - Optional keyword highlighting for "->"
-;; - Assembly syntax highlighting inside (asm ...) forms
-;; - Infix backtick expressions: `fun` highlighted with variable-name face
-;;   with optional backtick hiding (see `monad-infix-hide-backticks')
-;; - Eldoc integration: hover a function to see its signature; hover a variable
-;;   to see its type annotation and/or value — with preserved syntax colors.
-;;   Eldoc does NOT trigger when the cursor is immediately after a symbol token.
-;;   When calling a function, the current parameter is highlighted with
-;;   font-lock-variable-name-face and all others use the default face,
-;;   exactly like emacs-lisp-mode's parameter tracking.
-;; - rainbow-delimiters enabled by default with depth-2 for () and depth-3 for []
-;; - Imenu shows type signature + first line of docstring (both styles supported)
+;;
+;; Syntax
+;;   - Syntax highlighting for keywords, strings, characters, and comments
+;;   - Docstring recognition for functions, variables, and lambdas
+;;     (both plain string and :doc keyword styles)
+;;   - Underscore (_) highlighted as a shadow face for pattern matching wildcards
+;;   - Optional -> arrow highlighting (see `monad-highlight-arrow')
+;;
+;; Indentation
+;;   - Scheme-compatible indentation via `scheme-indent-function'
+;;   - Dedicated indentation for (asm ...) blocks
+;;
+;; Infix expressions
+;;   - Backtick infix calls (`fun`) highlighted with a distinct face
+;;   - Optional backtick hiding: only the operator name is shown
+;;     (see `monad-infix-hide-backticks')
+;;   - Operator characters (+, -, *, / ...) are auto-wrapped in backticks
+;;     when typed in infix position
+;;
+;; Assembly
+;;   - Full syntax highlighting inside (asm ...) forms: instructions,
+;;     registers, labels, directives, and numeric literals
+;;
+;; Eldoc
+;;   - Hover a function name to see its full type signature
+;;   - Hover a variable to see its type annotation and value
+;;   - When filling a call, the current parameter is highlighted and
+;;     all others are dimmed, matching elisp-mode's parameter tracking
+;;   - All signatures are syntax-colored to match the buffer
+;;
+;; Navigation and cross-references
+;;   - Xref backend supporting jump-to-definition for functions, variables,
+;;     typed parameters, and module qualified/unqualified symbols
+;;   - Cross-module xref: definitions are found in imported .mon files
+;;   - Imenu index with aligned type signatures and docstring previews
+;;
+;; Completion
+;;   - Completion-at-point for keywords, local definitions, and imports
+;;   - Import-aware: respects qualified, :as, hiding, and explicit export lists
+;;   - Distinct completion kinds for functions, variables, keywords, and
+;;     asm instructions (with nerd-icons-corfu support)
+;;
+;; Miscellaneous
+;;   - rainbow-delimiters enabled by default; eldoc signatures use matching
+;;     delimiter colors to stay consistent with the buffer appearance
+;;   - Electric backtick pairing via `electric-pair-mode'
+;;   - `C-c C-d' shows the full docstring of the symbol at point
 
 ;;; Code:
 
 (require 'lisp-mode)
 (require 'cl-lib)
 (require 'eldoc)
+(require 'xref)
 (require 'rainbow-delimiters)
 
 (defgroup monad nil
@@ -323,15 +360,22 @@ backtick pairs like `+` 22 `*` do not bleed into each other.")
 (defvar-local monad-infix--updating nil)
 
 (defun monad-infix--refresh-visibility ()
-  "Refresh backtick visibility around point."
   (when (and (derived-mode-p 'monad-mode)
              (not monad-infix--updating))
     (let ((monad-infix--updating t)
           (scan-start (save-excursion (forward-line -3) (point)))
           (scan-end   (save-excursion (forward-line  3) (point))))
       (with-silent-modifications
-        ;; Clear ALL invisible properties first to prevent stale ones accumulating
-        (remove-text-properties scan-start scan-end '(invisible nil))
+        ;; Only remove invisible props that WE set (tagged with monad-infix)
+
+        (let ((pos scan-start))
+          (while (< pos scan-end)
+            (let ((next (next-single-property-change pos 'monad-infix-invisible nil scan-end)))
+              (when (get-text-property pos 'monad-infix-invisible)
+                (remove-text-properties pos next '(invisible nil monad-infix-invisible nil)))
+              (setq pos next))))
+
+        ;; Re-apply with our tag
         (save-excursion
           (goto-char scan-start)
           (while (re-search-forward monad-infix-regexp scan-end t)
@@ -339,7 +383,9 @@ backtick pairs like `+` 22 `*` do not bleed into each other.")
                   (mend   (match-end 0)))
               (when monad-infix-hide-backticks
                 (put-text-property mstart (1+ mstart) 'invisible t)
-                (put-text-property (1- mend) mend 'invisible t)))))))))
+                (put-text-property mstart (1+ mstart) 'monad-infix-invisible t)
+                (put-text-property (1- mend) mend 'invisible t)
+                (put-text-property (1- mend) mend 'monad-infix-invisible t)))))))))
 
 (defun monad-infix-schedule-refresh ()
   "Schedule a backtick visibility refresh via idle timer."
@@ -489,7 +535,6 @@ closing backtick ready to type the RHS."
 
 (defun monad-post-self-insert ()
   "Handle post-insertion actions: asm fontification and infix operator wrapping."
-  ;; Asm block: re-fontify the current line when a colon is typed (label detection).
   (when (and (monad-in-asm-form-p)
              (eq (char-before) ?:))
     (save-excursion
@@ -497,7 +542,13 @@ closing backtick ready to type the RHS."
             (line-end (line-end-position)))
         (font-lock-flush line-start line-end)
         (font-lock-fontify-region line-start line-end))))
-  ;; Infix operator: wrap bare operator in backticks when LHS is not a call head.
+  ;; If we just typed a space inside a backtick pair `...|`),
+  ;; move the space to after the closing backtick instead.
+  (when (and (eq (char-before) ?\s)
+             (eq (char-after) ?`))
+    (delete-char -1)
+    (forward-char 1)
+    (insert ?\s))
   (when (monad--infix-auto-wrap-p)
     (monad--infix-do-wrap)))
 
@@ -1094,9 +1145,15 @@ Priority rules:
   (setq-local imenu-syntax-alist '(("+-*/.<>=?!$%_&~^:" . "w")))
   (setq-local completion-extra-properties
               (list :annotation-function #'monad-imenu-annotate))
-  (when (fboundp 'marginalia-annotators)
-    (add-to-list 'marginalia-annotators
+
+  (cond
+   ((boundp 'marginalia-annotator-registry)
+    (add-to-list 'marginalia-annotator-registry
                  '(imenu monad-imenu-annotate builtin none)))
+   ((boundp 'marginalia-annotators)
+    (add-to-list 'marginalia-annotators
+                 '(imenu monad-imenu-annotate builtin none))))
+
   (add-hook 'after-change-functions
             (lambda (&rest _) (monad--invalidate-docstring-cache))
             nil t)
