@@ -84,7 +84,7 @@
 (require 'cl-lib)
 (require 'eldoc)
 (require 'xref)
-(require 'porg)
+(require 'porg nil t)
 (require 'rainbow-delimiters)
 
 (defgroup monad nil
@@ -1180,7 +1180,8 @@ Priority rules:
   (add-hook 'post-command-hook #'monad-infix-schedule-refresh nil t)
   (monad--setup-electric-pair)
   (rainbow-delimiters-mode 1)
-  (porg-mode 1)
+  (when (fboundp 'porg-mode)
+    (porg-mode 1))
   (eldoc-mode 1)
   (setq-local eldoc-documentation-functions '(monad-eldoc-function))
   (setq-local eldoc-documentation-strategy #'eldoc-documentation-default))
