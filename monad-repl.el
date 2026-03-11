@@ -19,6 +19,9 @@
 ;; - Region evaluation
 ;; - ANSI color support
 
+;;; TODO [0/1]
+;; - [ ] Make eldoc work also on builtins
+
 ;;; Code:
 
 (require 'comint)
@@ -66,6 +69,13 @@ provides its own visual separation between inputs)."
   :safe 'booleanp
   :group 'monad-repl)
 
+;;; Faces
+
+(defface monad-repl-error-highlight
+  '((t :foreground "#ff6c6b" :background "#53383f"))
+  "Face used to highlight error positions in the Monad REPL."
+  :group 'monad-repl)
+
 ;;; Internal variables
 
 (defvar monad-repl-prompt-regexp "^Monad \xce\xbb "
@@ -79,6 +89,8 @@ provides its own visual separation between inputs)."
     (set-keymap-parent map comint-mode-map)
     (define-key map (kbd "TAB") #'completion-at-point)
     (define-key map (kbd "RET") #'monad-repl-maybe-send)
+    (define-key map (kbd "C-x C-n") #'monad-repl--next-error)
+    (define-key map (kbd "C-x C-p") #'monad-repl--prev-error)
     (define-key map (kbd "C-l") #'comint-clear-buffer)
     (define-key map (kbd "C-c C-l") #'monad-repl-load-file)
     (define-key map (kbd "C-c C-z") #'monad-repl-switch-back)
@@ -340,28 +352,6 @@ Returns list of name strings; populates `monad-repl--symbol-table'."
   "Request all completions from the REPL to populate the symbol table."
   (when (monad-repl-running-p)
     (monad-repl--get-completions "")))
-
-;; (defun monad-repl--parse-completion-output (output)
-;;   "Parse completion OUTPUT from ,complete command.
-;; Expected format:
-;; __COMPLETIONS__
-;; candidate1
-;; candidate2
-;; ...
-;; __END__"
-;;   (let ((completions nil)
-;;         (in-completions nil))
-;;     (dolist (line (split-string output "\n" t))
-;;       (let ((clean-line (string-trim (ansi-color-filter-apply line))))
-;;         (cond
-;;          ((string= clean-line "__COMPLETIONS__")
-;;           (setq in-completions t))
-;;          ((string= clean-line "__END__")
-;;           (setq in-completions nil))
-;;          (in-completions
-;;           (when (not (string-empty-p clean-line))
-;;             (push clean-line completions))))))
-;;     (nreverse completions)))
 
 (defun monad-repl--get-completions (prefix)
   "Get completion candidates for PREFIX.
@@ -695,6 +685,154 @@ Priority rules:
       (funcall callback doc)
       t)))
 
+;;; ERROR Buttonization
+
+(defun monad-repl--buttonize-errors (output)
+  "Buttonize <input>:LINE:COL: error: lines like compilation-mode."
+  (let ((result output))
+    (when (string-match "<input>:\\([0-9]+\\):\\([0-9]+\\):\\([^\n]*\\)" output)
+      (let* ((line       (string-to-number (match-string 1 output)))
+             (col        (string-to-number (match-string 2 output)))
+             (rest       (match-string 3 output))
+             (full-start (match-beginning 0))
+             (full-end   (match-end 0))
+             (keymap     (let ((map (make-sparse-keymap)))
+                           (define-key map [mouse-1] #'monad-repl--jump-to-error)
+                           (define-key map (kbd "RET") #'monad-repl--jump-to-error)
+                           map))
+             (props      `(monad-repl-error-line ,line
+                           monad-repl-error-col  ,col
+                           mouse-face            highlight
+                           help-echo             "mouse-1: go to error position"
+                           keymap                ,keymap)))
+        (setq result
+              (concat
+               (substring output 0 full-start)
+               (apply #'propertize "<input>"
+                      'face '(compilation-error :underline t) props)
+               (apply #'propertize ":"
+                      'face '(:underline t) props)
+               (apply #'propertize (number-to-string line)
+                      'face '(compilation-line-number :underline t) props)
+               (apply #'propertize ":"
+                      'face '(:underline t) props)
+               (apply #'propertize (number-to-string col)
+                      'face '(compilation-column-number :underline t) props)
+               (apply #'propertize ":" 'face 'default props)
+               (apply #'propertize rest 'face 'default props)
+               ;; Preserve everything after the matched region
+               (substring output full-end)))))
+    result))
+
+(defun monad-repl--lerp-color (from to step steps)
+  "Linearly interpolate FROM color toward TO at STEP out of STEPS."
+  (let* ((parse  (lambda (c)
+                   (list (string-to-number (substring c 1 3) 16)
+                         (string-to-number (substring c 3 5) 16)
+                         (string-to-number (substring c 5 7) 16))))
+         (fc     (funcall parse from))
+         (tc     (funcall parse to))
+         (t-     (/ (float step) steps))
+         (r      (round (+ (nth 0 fc) (* (- (nth 0 tc) (nth 0 fc)) t-))))
+         (g      (round (+ (nth 1 fc) (* (- (nth 1 tc) (nth 1 fc)) t-))))
+         (b      (round (+ (nth 2 fc) (* (- (nth 2 tc) (nth 2 fc)) t-)))))
+    (format "#%02x%02x%02x" r g b)))
+
+(defun monad-repl--pulse-error-region (beg end)
+  "Fade BEG..END from error colors to background, like `pulse' but for both fg and bg."
+  (let* ((ov      (make-overlay beg end))
+         (steps   pulse-iterations)
+         (delay   pulse-delay)
+         (fg-from (face-attribute 'monad-repl-error-highlight :foreground nil t))
+         (bg-from (face-attribute 'monad-repl-error-highlight :background nil t))
+         (fg-to   (face-attribute 'default :foreground nil t))
+         (bg-to   (face-attribute 'default :background nil t))
+         (step    0))
+    (overlay-put ov 'face `(:foreground ,fg-from :background ,bg-from))
+    (letrec ((timer
+              (run-with-timer
+               delay delay
+               (lambda ()
+                 (if (>= step steps)
+                     (progn (delete-overlay ov)
+                            (cancel-timer timer))
+                   (overlay-put ov 'face
+                                `(:foreground ,(monad-repl--lerp-color fg-from fg-to step steps)
+                                  :background ,(monad-repl--lerp-color bg-from bg-to step steps)))
+                   (setq step (1+ step)))))))
+      timer)))
+
+(defun monad-repl--jump-to-error ()
+  "Jump to the error position referenced by the button at point."
+  (interactive)
+  (let ((line (get-text-property (point) 'monad-repl-error-line))
+        (col  (get-text-property (point) 'monad-repl-error-col)))
+    (when (and line col)
+      (comint-previous-prompt 1)
+      (forward-line (1- line))
+      (beginning-of-line)
+      (forward-char (1- col))
+      (skip-chars-forward "^A-Za-z0-9_'!?$%&*/+<=>.^~-")
+      (let* ((beg (point))
+             (end (save-excursion
+                    (skip-chars-forward "A-Za-z0-9_'!?$%&*/+<=>.^~-")
+                    (if (= (point) beg) (1+ beg) (point)))))
+        (monad-repl--pulse-error-region beg end)))))
+
+(defvar-local monad-repl--last-error-pos nil
+  "Position of the last error jumped to.")
+
+(defun monad-repl--error-positions ()
+  "Return a sorted list of all error button start positions in the buffer."
+  (let ((positions nil)
+        (pos (point-min)))
+    (while (< pos (point-max))
+      (let ((next (next-single-property-change pos 'monad-repl-error-line)))
+        (if next
+            (progn
+              (when (get-text-property next 'monad-repl-error-line)
+                (push next positions))
+              (setq pos next))
+          (setq pos (point-max)))))
+    (nreverse positions)))
+
+(defun monad-repl--next-error (&optional n)
+  "Jump to the Nth next error in the REPL buffer."
+  (interactive "p")
+  (let* ((n (or n 1))
+         (positions (monad-repl--error-positions))
+         (last monad-repl--last-error-pos)
+         (candidates (if last
+                         (seq-filter (lambda (p) (> p last)) positions)
+                       positions)))
+    (if (< n (length candidates))
+        (let ((target (nth (1- n) candidates)))
+          (setq monad-repl--last-error-pos target)
+          (goto-char target)
+          (monad-repl--jump-to-error))
+      (if candidates
+          (let ((target (car candidates)))
+            (setq monad-repl--last-error-pos target)
+            (goto-char target)
+            (monad-repl--jump-to-error))
+        (user-error "No more errors")))))
+
+(defun monad-repl--prev-error (&optional n)
+  "Jump to the Nth previous error in the REPL buffer."
+  (interactive "p")
+  (let* ((n (or n 1))
+         (positions (monad-repl--error-positions))
+         (last monad-repl--last-error-pos)
+         (candidates (if last
+                         (reverse (seq-filter (lambda (p) (< p last)) positions))
+                       (reverse positions))))
+    (if candidates
+        (let ((target (nth (1- (min n (length candidates))) candidates)))
+          (setq monad-repl--last-error-pos target)
+          (goto-char target)
+          (monad-repl--jump-to-error))
+      (user-error "No previous errors"))))
+
 ;;; ANSI color support
 
 (defun monad-repl--ansi-color-filter (string)
@@ -878,6 +1016,9 @@ Priority rules:
               (monad-repl--clear-completion-cache)
               nil) ; Return nil to continue normal processing
             nil t)
+
+  (add-hook 'comint-preoutput-filter-functions
+            #'monad-repl--buttonize-errors nil t)
 
   ;; ANSI colors
   (monad-repl--setup-ansi-colors)
