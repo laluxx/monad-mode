@@ -5,8 +5,9 @@
 ;; Author: Laluxx
 ;; Maintainer: Laluxx
 ;; Version: 0.0.1
-;; Package-Requires: ((emacs "26.1"))
+;; Package-Requires: ((emacs "28.1"))
 ;; Keywords: languages processes repl
+;; URL: https://github.com/laluxx/monad-mode
 
 ;;; Commentary:
 
@@ -100,7 +101,7 @@ provides its own visual separation between inputs)."
   "Keymap for `monad-repl-mode'.")
 
 (defvar-local monad-repl--last-source-buffer nil
-  "The last monad-mode buffer that switched to this REPL.")
+  "The last `monad-mode' buffer that switched to this REPL.")
 
 (defvar-local monad-repl--completion-cache nil
   "Cache for REPL completions.")
@@ -196,7 +197,7 @@ provides its own visual separation between inputs)."
     (lisp-indent-line)))
 
 (defun monad-repl-maybe-send ()
-  "Send input if sexp is balanced AND point is at end, otherwise newline and indent."
+  "Send input if balanced and at end, otherwise newline and indent."
   (interactive)
   (let ((level (monad-repl--nesting-level)))
     (cond
@@ -402,8 +403,7 @@ Returns (START . END) or nil."
         (let ((bounds (monad-repl--completion-bounds)))
           (when bounds
             (let* ((start (car bounds))
-                   (end   (cdr bounds))
-                   (prefix (buffer-substring-no-properties start end)))
+                   (end   (cdr bounds)))
               (list start end
                     (completion-table-dynamic
                      (lambda (str)
@@ -446,15 +446,6 @@ Returns (START . END) or nil."
     (completion-at-point)))
 
 ;;; Eldoc
-
-(defun monad-repl-debug-eldoc ()
-  (interactive)
-  (message "after-sym=%S is-fn=%S on-arg=%S arg-idx=%S fn-name=%S"
-           (monad-repl--point-after-symbol-p)
-           (monad-repl--point-is-fn-name-p)
-           (monad-repl--point-on-arg-p)
-           (monad-repl--current-arg-index)
-           (monad-repl--enclosing-fn-name)))
 
 (defun monad-repl--depth-face (depth)
   "Return the rainbow-delimiters face for DEPTH."
@@ -555,7 +546,7 @@ Pass -1 to put all params in default face (hovering the fn name itself)."
           (skip-chars-forward " \t\n")
           (condition-case nil
               (forward-sexp 1)
-            (error (error "no-fn")))
+            (error (error "No-fn")))
           (catch 'done
             (let ((idx 0))
               (while (and (< (point) orig) (not (eobp)))
@@ -679,7 +670,8 @@ Priority rules:
               (monad-repl--hover-doc sym-name))))))))
 
 (defun monad-repl--eldoc-function (callback &rest _)
-  "Eldoc backend for `monad-repl-mode'."
+  "Eldoc backend for `monad-repl-mode'.
+CALLBACK is called with the documentation string for the current context."
   (when (monad-repl-running-p)
     (when-let* ((doc (monad-repl--eldoc-get-doc)))
       (funcall callback doc)
@@ -688,7 +680,7 @@ Priority rules:
 ;;; ERROR Buttonization
 
 (defun monad-repl--buttonize-errors (output)
-  "Buttonize <input>:LINE:COL: error: lines like compilation-mode."
+  "Buttonize <input>:LINE:COL: error: lines in OUTPUT like `compilation-mode'."
   (let ((result output))
     (when (string-match "<input>:\\([0-9]+\\):\\([0-9]+\\):\\([^\n]*\\)" output)
       (let* ((line       (string-to-number (match-string 1 output)))
@@ -739,7 +731,8 @@ Priority rules:
     (format "#%02x%02x%02x" r g b)))
 
 (defun monad-repl--pulse-error-region (beg end)
-  "Fade BEG..END from error colors to background, like `pulse' but for both fg and bg."
+  "Fade BEG..END from error colors to background.
+Like `pulse' but interpolates both foreground and background."
   (let* ((ov      (make-overlay beg end))
          (steps   pulse-iterations)
          (delay   pulse-delay)
@@ -858,13 +851,15 @@ Priority rules:
           t)))))
 
 (defun monad-repl--wrap-fontify-region (beg end &optional loudly)
-  "Fontify region, but when called for prompt only fontify prompt area."
+  "Fontify region between BEG and END.
+If LOUDLY is non-nil, print status messages during fontification."
   (save-restriction
     (widen)
     (font-lock-default-fontify-region beg end loudly)))
 
-(defun monad-repl--wrap-unfontify-region (beg end &optional loudly)
-  "Unfontify only within the active prompt, never past output."
+(defun monad-repl--wrap-unfontify-region (beg end &optional _loudly)
+  "Unfontify only within the active prompt, never past output.
+BEG and END are the region boundaries."
   (save-restriction
     (when (monad-repl--narrow-to-prompt)
       (let ((font-lock-dont-widen t)
@@ -972,7 +967,7 @@ Priority rules:
 ;;; Mode definition
 
 (defun monad-repl--output-newline (output)
-  "Add a blank line after each REPL output chunk, when prompt is hidden."
+  "Add a blank line after each REPL OUTPUT chunk, when prompt is hidden."
   (if monad-repl-show-prompt
       output
     (concat output "\n")))
@@ -1063,7 +1058,7 @@ Priority rules:
 ;;;###autoload
 (defun monad-repl-setup-keys ()
   "Set up REPL keybindings in `monad-mode-map'.
-This should be called from monad-mode initialization."
+This should be called from `monad-mode' initialization."
   (when (boundp 'monad-mode-map)
     (define-key monad-mode-map (kbd "C-c C-z") #'monad-repl)
     (define-key monad-mode-map (kbd "C-c C-r") #'monad-repl-eval-region)
@@ -1075,8 +1070,8 @@ This should be called from monad-mode initialization."
 
 ;;;###autoload
 (defun monad-repl-setup-hooks ()
-  "Set up REPL hooks for monad-mode.
-This should be called from monad-mode initialization."
+  "Set up REPL hooks for `monad-mode'.
+This should be called from `monad-mode' initialization."
   (add-hook 'after-save-hook #'monad-repl-load-on-save-hook nil t))
 
 (provide 'monad-repl)

@@ -337,7 +337,7 @@ Returns the first line of the docstring, or nil."
          (propertize doc 'face 'font-lock-doc-face))))))
 
 (defun monad-char-literal-matcher (limit)
-  "Match character literals like 'a' or '\\n' up to LIMIT."
+  "Match character literals like \\='a\\=' or \\='\\\\n\\=' up to LIMIT."
   (catch 'found
     (while (re-search-forward "'\\(\\\\.[^']*\\|.\\)'" limit t)
       (throw 'found t))
