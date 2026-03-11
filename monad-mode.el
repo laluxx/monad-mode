@@ -86,6 +86,8 @@
 (require 'xref)
 (require 'porg nil t)
 (require 'rainbow-delimiters)
+(require 'monad-repl nil t)
+
 
 (defgroup monad nil
   "Major mode for editing Monad code."
@@ -174,11 +176,11 @@ The backticks become visible again when point is inside the expression."
 (define-abbrev-table 'monad-mode-abbrev-table ())
 
 (defconst monad-keywords
-  '("define" "lambda" "match" "layout" "data" "deriving"
+  '("define" "lambda" "match" "layout" "type" "data" "deriving"
     "let" "letrec" "let*" "if" "cond" "case" "else"
     "and" "or" "not" "quote" "unquote" "quasiquote"
-    "begin" "do" "when" "unless" "error" "instance" "asm"
-    "module" "import" "qualified" "as" "hiding" )
+    "begin" "when" "unless" "error" "instance" "asm"
+    "module" "import" "qualified" "hiding" "tests" "test")
   "Keywords for the Monad programming language.")
 
 ;;; Imenu — flat index with cached docstring annotations
@@ -330,12 +332,10 @@ Returns the first line of the docstring, or nil."
          (propertize doc 'face 'font-lock-doc-face))))))
 
 (defun monad-char-literal-matcher (limit)
-  "Match character literals \='x\=' up to LIMIT."
+  "Match character literals like 'a' or '\\n' up to LIMIT."
   (catch 'found
-    (while (re-search-forward "'\\(.\\)'" limit t)
-      (let ((matched-char (match-string 1)))
-        (when (= (length matched-char) 1)
-          (throw 'found t))))
+    (while (re-search-forward "'\\(\\\\.[^']*\\|.\\)'" limit t)
+      (throw 'found t))
     nil))
 
 ;;; Infix backtick support
@@ -1186,6 +1186,31 @@ Priority rules:
   (setq-local eldoc-documentation-functions '(monad-eldoc-function))
   (setq-local eldoc-documentation-strategy #'eldoc-documentation-default))
 
+(defun monad-xref-go-back ()
+  "Go back with xref, keeping the REPL in its own window."
+  (interactive)
+  (let* ((repl-buf    (and (boundp 'monad-repl-buffer-name)
+                           (get-buffer monad-repl-buffer-name)))
+         (history     (funcall xref-history-storage))
+         (top-marker  (car (car history)))
+         (top-buf     (and (markerp top-marker) (marker-buffer top-marker)))
+         (origin-win  (selected-window)))
+    (cond
+     ;; History points back to the REPL
+     ((and repl-buf top-buf (eq top-buf repl-buf))
+      ;; Don't call xref-go-back, handle the pop ourselves
+      (let* ((marker (pop (car (funcall xref-history-storage))))
+             (win    (or (get-buffer-window repl-buf)
+                         (let ((w (split-window-sensibly origin-win)))
+                           (or w (split-window origin-win nil 'below))))))
+        (select-window win)
+        (switch-to-buffer repl-buf)
+        (goto-char (marker-position marker))
+        (run-hooks 'xref-after-return-hook)))
+     ;; Normal xref go back
+     (t
+      (xref-go-back)))))
+
 ;;; Module system
 
 (defun monad--current-file-dir ()
@@ -1193,10 +1218,33 @@ Priority rules:
   (when buffer-file-name
     (file-name-directory buffer-file-name)))
 
+(defcustom monad-core-lib-path "/usr/local/lib/monad"
+  "Path to the installed Monad core library."
+  :type 'string
+  :group 'monad)
+
 (defun monad--module-file (module-name)
-  "Return the path to MODULE-NAME's .mon file relative to the current buffer."
-  (when-let* ((dir (monad--current-file-dir)))
-    (expand-file-name (concat module-name ".mon") dir)))
+  "Return the path to MODULE-NAME's .mon file, or nil if not found.
+Searches the current buffer's directory first, then subdirectories,
+then the installed core library at `monad-core-lib-path'."
+  (let ((filename (concat module-name ".mon")))
+    (or
+     ;; 1. Sibling of current file
+     (when-let* ((dir (monad--current-file-dir)))
+       (let ((f (expand-file-name filename dir)))
+         (when (file-readable-p f) f)))
+     ;; 2. Core library — search recursively
+     (when (file-directory-p monad-core-lib-path)
+       (let ((found nil))
+         (dolist (f (directory-files-recursively monad-core-lib-path "\\.mon$"))
+           (when (string= (file-name-nondirectory f) filename)
+             (setq found f)))
+         found)))))
+
+;; (defun monad--module-file (module-name)
+;;   "Return the path to MODULE-NAME's .mon file relative to the current buffer."
+;;   (when-let* ((dir (monad--current-file-dir)))
+;;     (expand-file-name (concat module-name ".mon") dir)))
 
 (defun monad--parse-exports (file)
   "Return the list of exported symbol names from FILE.
@@ -1348,42 +1396,45 @@ Each symbol is propertized with the correct `company-kind': `function' or
 
 (defun monad-completion-at-point ()
   "Completion-at-point for Monad mode."
-  (let* ((end   (point))
-         (start (save-excursion
-                  (skip-syntax-backward "w_%")
-                  (when (and (> (point) (point-min))
-                             (eq (char-before) ?.))
-                    (skip-syntax-backward "w_"))
-                  (point)))
-         (in-asm (monad-in-asm-form-p start))
-         (candidates
-          (cond
-           ((and in-asm (monad--asm-first-token-p start))
-            (mapcar (lambda (i) (propertize i 'company-kind 'monad-asm))
-                    monad-asm-instructions))
-           (in-asm
-            (monad--asm-operand-candidates))
-           (t
-            (monad--all-completions))))
-         (kind-fn (monad--kind-function candidates)))
-    (list start end
-          (completion-table-dynamic (lambda (_) candidates))
-          :exclusive    'no
-          :company-kind kind-fn
-          :annotation-function
-          (lambda (cand)
-            (pcase (funcall kind-fn cand)
-              ('function
-               (if-let* ((hdr (monad--extract-function-header cand)))
-                   (concat " " hdr)
-                 " <function>"))
-              ('variable
-               (if-let* ((info (monad--extract-variable-info cand)))
-                   (concat " " info)
-                 " <variable>"))
-              ('monad-asm " <asm>")
-              ('keyword   " <keyword>")
-              (_          ""))))))
+  (let ((ppss (syntax-ppss)))
+    (unless (or (nth 3 ppss)
+                (nth 4 ppss))
+      (let* ((end   (point))
+             (start (save-excursion
+                      (skip-syntax-backward "w_%")
+                      (when (and (> (point) (point-min))
+                                 (eq (char-before) ?.))
+                        (skip-syntax-backward "w_"))
+                      (point)))
+             (in-asm (monad-in-asm-form-p start))
+             (candidates
+              (cond
+               ((and in-asm (monad--asm-first-token-p start))
+                (mapcar (lambda (i) (propertize i 'company-kind 'monad-asm))
+                        monad-asm-instructions))
+               (in-asm
+                (monad--asm-operand-candidates))
+               (t
+                (monad--all-completions))))
+             (kind-fn (monad--kind-function candidates)))
+        (list start end
+              (completion-table-dynamic (lambda (_) candidates))
+              :exclusive    'no
+              :company-kind kind-fn
+              :annotation-function
+              (lambda (cand)
+                (pcase (funcall kind-fn cand)
+                  ('function
+                   (if-let* ((hdr (monad--extract-function-header cand)))
+                       (concat " " hdr)
+                     " <function>"))
+                  ('variable
+                   (if-let* ((info (monad--extract-variable-info cand)))
+                       (concat " " info)
+                     " <variable>"))
+                  ('monad-asm " <asm>")
+                  ('keyword   " <keyword>")
+                  (_          ""))))))))
 
 ;;; Xref backend
 
@@ -1414,9 +1465,9 @@ Each symbol is propertized with the correct `company-kind': `function' or
         (goto-char (point-min))
         (while (re-search-forward
                 (concat "^(define\\s-+\\(?:"
-                        "(\\(" (regexp-quote symbol) "\\)\\>"
+                        "(\\(" (regexp-quote symbol) "\\)\\_>"
                         "\\|\\[\\(" (regexp-quote symbol) "\\)\\s-+::"
-                        "\\|\\(" (regexp-quote symbol) "\\)\\>\\)")
+                        "\\|\\(" (regexp-quote symbol) "\\)\\_>\\)")
                 nil t)
           (let ((pos (or (match-beginning 1)
                          (match-beginning 2)
@@ -1585,13 +1636,16 @@ Each symbol is propertized with the correct `company-kind': `function' or
   :doc "Keymap for Monad mode."
   :parent lisp-mode-shared-map
   ":" #'monad-colon
-  "C-c C-d" #'monad-show-docstring)
+  "C-c C-d" #'monad-show-docstring
+  "M-," #'monad-xref-go-back)
 
 ;;;###autoload
 (define-derived-mode monad-mode prog-mode "Monad"
   "Major mode for editing Monad code.
 \\{monad-mode-map}"
-  (monad-mode-variables))
+  (monad-mode-variables)
+  (when (featurep 'monad-repl)
+    (monad-repl-setup-keys)))
 
 ;; Indentation rules
 (put 'lambda 'scheme-indent-function 1)
