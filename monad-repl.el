@@ -307,14 +307,13 @@ If FILENAME is nil, use the current buffer's file."
         ;; reach comint's default filter which would print it
         (set-process-filter proc original-filter)))))
 
+(defvar-local monad-repl--symbol-table (make-hash-table :test 'equal)
+  "Maps symbol names to (kind signature docstring) from the REPL.")
+
 (defun monad-repl--parse-completion-output (output)
   "Parse completion OUTPUT from ,complete command.
-Expected format:
-__COMPLETIONS__
-candidate1
-candidate2
-...
-__END__"
+Each line: name TAB kind TAB signature TAB docstring
+Returns list of name strings; populates `monad-repl--symbol-table'."
   (let ((completions nil)
         (in-completions nil))
     (dolist (line (split-string output "\n" t))
@@ -326,8 +325,43 @@ __END__"
           (setq in-completions nil))
          (in-completions
           (when (not (string-empty-p clean-line))
-            (push clean-line completions))))))
+            (let* ((parts (split-string clean-line "\t"))
+                   (name  (nth 0 parts))
+                   (kind  (nth 1 parts))
+                   (sig   (nth 2 parts))
+                   (doc   (nth 3 parts)))
+              (when (and name (not (string-empty-p name)))
+                (push name completions)
+                (puthash name (list kind sig doc)
+                         monad-repl--symbol-table))))))))
     (nreverse completions)))
+
+(defun monad-repl--refresh-symbol-table ()
+  "Request all completions from the REPL to populate the symbol table."
+  (when (monad-repl-running-p)
+    (monad-repl--get-completions "")))
+
+;; (defun monad-repl--parse-completion-output (output)
+;;   "Parse completion OUTPUT from ,complete command.
+;; Expected format:
+;; __COMPLETIONS__
+;; candidate1
+;; candidate2
+;; ...
+;; __END__"
+;;   (let ((completions nil)
+;;         (in-completions nil))
+;;     (dolist (line (split-string output "\n" t))
+;;       (let ((clean-line (string-trim (ansi-color-filter-apply line))))
+;;         (cond
+;;          ((string= clean-line "__COMPLETIONS__")
+;;           (setq in-completions t))
+;;          ((string= clean-line "__END__")
+;;           (setq in-completions nil))
+;;          (in-completions
+;;           (when (not (string-empty-p clean-line))
+;;             (push clean-line completions))))))
+;;     (nreverse completions)))
 
 (defun monad-repl--get-completions (prefix)
   "Get completion candidates for PREFIX.
@@ -355,17 +389,30 @@ Returns (START . END) or nil."
           (skip-chars-backward "A-Za-z0-9_:.-")
           (cons (point) end))))))
 
+(defun monad-repl--symbol-kind (name)
+  "Return a company kind symbol for NAME based on the symbol table."
+  (let ((info (and monad-repl--symbol-table
+                   (gethash name monad-repl--symbol-table))))
+    (if info
+        (let ((kind (nth 0 info)))
+          (cond
+           ((string= kind "func")    'function)
+           ((string= kind "builtin") 'function)
+           ((string= kind "var")     'variable)
+           ((string= kind "keyword") 'keyword)
+           (t                        'text)))
+      'text)))
+
 (defun monad-repl-completion-at-point ()
   "Completion at point function for Monad REPL."
   (when (derived-mode-p 'monad-repl-mode)
-    ;; Don't compete with import completion
     (let* ((line-start (line-beginning-position))
            (before (buffer-substring-no-properties line-start (point))))
       (unless (string-match "(import +" before)
         (let ((bounds (monad-repl--completion-bounds)))
           (when bounds
             (let* ((start (car bounds))
-                   (end (cdr bounds))
+                   (end   (cdr bounds))
                    (prefix (buffer-substring-no-properties start end)))
               (list start end
                     (completion-table-dynamic
@@ -373,7 +420,7 @@ Returns (START . END) or nil."
                        (or (monad-repl--get-completions str) nil)))
                     :exclusive 'no
                     :company-doc-buffer #'ignore
-                    :company-kind (lambda (_) 'variable)))))))))
+                    :company-kind #'monad-repl--symbol-kind))))))))
 
 ;;;; Non protocol completions
 
@@ -407,6 +454,246 @@ Returns (START . END) or nil."
              (eq last-command-event ?\s)
              (looking-back "(import +" (line-beginning-position)))
     (completion-at-point)))
+
+;;; Eldoc
+
+(defun monad-repl-debug-eldoc ()
+  (interactive)
+  (message "after-sym=%S is-fn=%S on-arg=%S arg-idx=%S fn-name=%S"
+           (monad-repl--point-after-symbol-p)
+           (monad-repl--point-is-fn-name-p)
+           (monad-repl--point-on-arg-p)
+           (monad-repl--current-arg-index)
+           (monad-repl--enclosing-fn-name)))
+
+(defun monad-repl--depth-face (depth)
+  "Return the rainbow-delimiters face for DEPTH."
+  (intern (format "rainbow-delimiters-depth-%d-face"
+                  (max 1 (min 9 (1+ depth))))))
+
+(defun monad-repl--propertize-sig (sig)
+  "Propertize SIG string with syntax colours."
+  (let ((s (copy-sequence sig))
+        (depth 0))
+    ;; Delimiters
+    (dotimes (i (length s))
+      (let ((ch (aref s i)))
+        (cond
+         ((memq ch '(?\( ?\[))
+          (setq depth (1+ depth))
+          (add-face-text-property i (1+ i) (monad-repl--depth-face depth) t s))
+         ((memq ch '(?\) ?\]))
+          (add-face-text-property i (1+ i) (monad-repl--depth-face depth) t s)
+          (setq depth (max 0 (1- depth)))))))
+    ;; :: and -> operators
+    (let ((i 0))
+      (while (string-match "\\(::\\|->\\)" s i)
+        (add-face-text-property (match-beginning 0) (match-end 0)
+                                'font-lock-builtin-face t s)
+        (setq i (match-end 0))))
+    s))
+
+(defun monad-repl--propertize-sig-with-active (sig active-idx)
+  "Return SIG propertized with parameter at ACTIVE-IDX highlighted.
+Pass -1 to put all params in default face (hovering the fn name itself)."
+  (let ((s (monad-repl--propertize-sig sig))
+        (spans nil)
+        (i 0))
+    (while (string-match "\\[\\([a-z_][A-Za-z0-9_']*\\)[ \t]*::" sig i)
+      (push (cons (match-beginning 1) (match-end 1)) spans)
+      (setq i (match-end 0)))
+    (setq spans (nreverse spans))
+    (cl-loop for span in spans
+             for idx from 0
+             do (add-face-text-property
+                 (car span) (cdr span)
+                 (if (= idx active-idx)
+                     'font-lock-variable-name-face
+                   'default)
+                 nil s))
+    s))
+
+(defun monad-repl--point-after-symbol-p ()
+  "Return non-nil when point is at the trailing edge of a symbol."
+  (and (> (point) (point-min))
+       (let ((syn (char-syntax (char-before))))
+         (or (eq syn ?w) (eq syn ?_)))))
+
+(defun monad-repl--point-is-fn-name-p ()
+  "Return non-nil when point is ON the function-name token of a call."
+  (save-excursion
+    (condition-case nil
+        (let ((orig (progn
+                      (skip-chars-forward "A-Za-z0-9_'!?$%&*/+<=>.^~-")
+                      (skip-chars-backward "A-Za-z0-9_'!?$%&*/+<=>.^~-")
+                      (point))))
+          (up-list -1)
+          (when (eq (char-after) ?\()
+            (forward-char 1)
+            (skip-chars-forward " \t\n")
+            (= (point) orig)))
+      (error nil))))
+
+(defun monad-repl--point-on-arg-p ()
+  "Return non-nil when point is on a symbol in argument position."
+  (when (symbol-at-point)
+    (let* ((sym-start (save-excursion
+                        (skip-chars-backward "A-Za-z0-9_'!?$%&*/+<=>.^~-")
+                        (point)))
+           (fn-end (save-excursion
+                     (condition-case nil
+                         (progn
+                           (let ((found nil))
+                             (while (not found)
+                               (up-list -1)
+                               (when (eq (char-after) ?\()
+                                 (setq found t)))
+                             (forward-char 1)
+                             (skip-chars-forward " \t\n")
+                             (skip-chars-forward "A-Za-z0-9_'!?$%&*/+<=>.^~-")
+                             (point)))
+                       (error nil)))))
+      (and fn-end (> sym-start fn-end)))))
+
+(defun monad-repl--current-arg-index ()
+  "Return zero-based argument index at point inside a call form, or nil."
+  (save-excursion
+    (condition-case nil
+        (let ((orig (point)))
+          (up-list -1)
+          (forward-char 1)
+          (skip-chars-forward " \t\n")
+          (condition-case nil
+              (forward-sexp 1)
+            (error (error "no-fn")))
+          (catch 'done
+            (let ((idx 0))
+              (while (and (< (point) orig) (not (eobp)))
+                (skip-chars-forward " \t\n")
+                (when (>= (point) orig) (throw 'done idx))
+                (condition-case nil
+                    (progn (forward-sexp 1)
+                           (when (<= (point) orig)
+                             (setq idx (1+ idx))))
+                  (error (throw 'done idx))))
+              idx)))
+      (error nil))))
+
+(defun monad-repl--enclosing-fn-name ()
+  "Return the function name of the enclosing call form, or nil."
+  (save-excursion
+    (condition-case nil
+        (progn
+          (up-list -1)
+          (forward-char 1)
+          (skip-chars-forward " \t\n")
+          (when (looking-at "\\(?:\\sw\\|\\s_\\|[!?$%&*/+<=>.^~-]\\)+")
+            (match-string-no-properties 0)))
+      (error nil))))
+
+(defun monad-repl--lookup (name)
+  "Return (kind sig doc) for NAME from the symbol table, or nil."
+  (and monad-repl--symbol-table
+       (gethash name monad-repl--symbol-table)))
+
+(defun monad-repl--format-display-sig (name info)
+  "Return a display string for NAME given INFO (kind sig doc).
+Variables are shown as [name :: Type], functions show their full sig."
+  (let* ((kind (nth 0 info))
+         (sig  (nth 1 info))
+         (doc  (nth 2 info))
+         (doc-part (when (and doc (not (string-empty-p doc)))
+                     (propertize doc 'face 'font-lock-doc-face))))
+    (cond
+     ;; Variable: [name :: Type]
+     ((string= kind "var")
+      (let* ((bracket (if (and sig (not (string-empty-p sig)))
+                          (format "[%s :: %s]" name sig)
+                        (format "[%s]" name)))
+             (s (monad-repl--propertize-sig bracket)))
+        (add-face-text-property 1 (1+ (length name))
+                                'font-lock-variable-name-face t s)
+        (concat s (when doc-part (concat " — " doc-part)))))
+     ;; Keyword: just the name
+     ((string= kind "keyword")
+      (propertize name 'face 'font-lock-keyword-face))
+     ;; Builtin: no name in sig, prepend it
+     ((string= kind "builtin")
+      (let* ((name-face (propertize name 'face 'font-lock-function-name-face))
+             (sig-part  (when (and sig (not (string-empty-p sig)))
+                          (monad-repl--propertize-sig sig))))
+        (concat name-face
+                (when sig-part (concat " " sig-part))
+                (when doc-part (concat " — " doc-part)))))
+     ;; Func: sig is already "(name [p :: T] -> R)", no need to prepend name
+     (t
+      (concat (if (and sig (not (string-empty-p sig)))
+                  (monad-repl--propertize-sig sig)
+                (propertize name 'face 'font-lock-function-name-face))
+              (when doc-part (concat " — " doc-part)))))))
+
+(defun monad-repl--hover-doc (name)
+  "Return a propertized eldoc hover string for NAME."
+  (when-let* ((info (monad-repl--lookup name)))
+    (monad-repl--format-display-sig name info)))
+
+(defun monad-repl--call-sig (fn-name arg-idx)
+  "Return propertized signature for FN-NAME with ARG-IDX parameter highlighted."
+  (when-let* ((info (monad-repl--lookup fn-name))
+              (sig  (nth 1 info))
+              (_ (not (string-empty-p sig))))
+    (let* ((doc      (nth 2 info))
+           (doc-part (when (and doc (not (string-empty-p doc)))
+                       (propertize doc 'face 'font-lock-doc-face))))
+      (concat (monad-repl--propertize-sig-with-active sig arg-idx)
+              (when doc-part (concat " — " doc-part))))))
+
+(defun monad-repl--eldoc-get-doc ()
+  "Return propertized eldoc string for the current context, or nil.
+
+Priority rules:
+  1. Trailing edge of a symbol, not on an argument, not the fn name → nil.
+  2. Point ON the function-name token of a call → full sig, all params dimmed.
+  3. Point ON an argument symbol → hover for that symbol, fallback to call sig.
+  4. Point in a gap inside a call → sig with current param highlighted.
+  5. Fallback: generic hover over any symbol at point."
+  (let* ((sym      (symbol-at-point))
+         (sym-name (and sym (symbol-name sym))))
+    (cond
+     ;; Rule 1: trailing edge with no useful context → silent
+     ((and (monad-repl--point-after-symbol-p)
+           (not (monad-repl--point-on-arg-p))
+           (not (monad-repl--point-is-fn-name-p))
+           (monad-repl--current-arg-index))
+      nil)
+     ;; Rule 2: ON the function name → full sig, all params dimmed
+     ((monad-repl--point-is-fn-name-p)
+      (when sym-name
+        (monad-repl--call-sig sym-name -1)))
+     ;; Rule 3: ON an argument symbol → hover, fallback to call sig
+     ((monad-repl--point-on-arg-p)
+      (when sym-name
+        (or (monad-repl--hover-doc sym-name)
+            (let ((arg-idx (monad-repl--current-arg-index))
+                  (fn-name (monad-repl--enclosing-fn-name)))
+              (when (and fn-name arg-idx)
+                (monad-repl--call-sig fn-name arg-idx))))))
+     ;; Rule 4: gap inside a call → highlighted parameter
+     (t
+      (let* ((arg-idx (monad-repl--current-arg-index))
+             (fn-name (when arg-idx (monad-repl--enclosing-fn-name))))
+        (or (when (and fn-name arg-idx)
+              (monad-repl--call-sig fn-name arg-idx))
+            ;; Rule 5: no call context → generic hover
+            (when sym-name
+              (monad-repl--hover-doc sym-name))))))))
+
+(defun monad-repl--eldoc-function (callback &rest _)
+  "Eldoc backend for `monad-repl-mode'."
+  (when (monad-repl-running-p)
+    (when-let* ((doc (monad-repl--eldoc-get-doc)))
+      (funcall callback doc)
+      t)))
 
 ;;; ANSI color support
 
@@ -613,6 +900,15 @@ Returns (START . END) or nil."
 
   ;; Xref
   (add-hook 'xref-backend-functions #'monad-repl-xref-backend nil t)
+
+  ;; Eldoc
+  (setq-local eldoc-documentation-functions '(monad-repl--eldoc-function))
+  (setq-local eldoc-documentation-strategy #'eldoc-documentation-default)
+  (eldoc-mode 1)
+  (run-with-idle-timer 1 nil #'monad-repl--refresh-symbol-table)
+
+  ;; Populate symbol table eagerly so eldoc works immediately
+  (run-with-idle-timer 1 nil #'monad-repl--refresh-symbol-table)
 
   ;; Welcome message
   (unless (comint-check-proc (current-buffer))

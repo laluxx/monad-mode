@@ -78,6 +78,11 @@
 ;;   - Electric backtick pairing via `electric-pair-mode'
 ;;   - `C-c C-d' shows the full docstring of the symbol at point
 
+;;; TODO [0/1]
+;; - [ ] If There is a repl we could also know the type of stuff
+;;       in eldoc in monad-mode.
+
+
 ;;; Code:
 
 (require 'lisp-mode)
