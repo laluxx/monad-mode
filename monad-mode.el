@@ -79,6 +79,7 @@
 ;;   - `C-c C-d' shows the full docstring of the symbol at point
 
 ;;; TODO [0/1]
+;; - [ ] "include <" should complete with C libraries
 ;; - [ ] If There is a repl we could also know the type of stuff
 ;;       in eldoc in monad-mode.
 
@@ -185,7 +186,8 @@ The backticks become visible again when point is inside the expression."
     "let" "letrec" "let*" "if" "cond" "case" "else"
     "and" "or" "not" "quote" "unquote" "quasiquote"
     "begin" "when" "unless" "error" "instance" "asm"
-    "module" "import" "qualified" "hiding" "tests" "test")
+    "module" "import" "qualified" "hiding" "tests" "test"
+    "take" "drop" "include" "until")
   "Keywords for the Monad programming language.")
 
 ;;; Imenu — flat index with cached docstring annotations
@@ -561,6 +563,11 @@ closing backtick ready to type the RHS."
   (when (monad--infix-auto-wrap-p)
     (monad--infix-do-wrap)))
 
+(defun monad-insert-lambda ()
+  "Insert λ, or .λ if preceded by λx pattern (λ two chars back)."
+  (interactive)
+  (insert (if (eq (char-before (- (point) 1)) ?λ) ".λ" "λ")))
+
 (defun monad-colon ()
   "Insert a colon and auto-indent if in asm block."
   (interactive)
@@ -646,6 +653,10 @@ closing backtick ready to type the RHS."
   "Return font-lock keywords for Monad mode."
   (append
    (list
+
+    '("\\<include\\s-+\\(<[^>\n]+>\\)"
+      (1 font-lock-string-face t))
+
     (list 'monad-infix-matcher
           '(0 'monad-infix-face t)
           '(1 'monad-infix-face t))
@@ -1246,11 +1257,6 @@ then the installed core library at `monad-core-lib-path'."
              (setq found f)))
          found)))))
 
-;; (defun monad--module-file (module-name)
-;;   "Return the path to MODULE-NAME's .mon file relative to the current buffer."
-;;   (when-let* ((dir (monad--current-file-dir)))
-;;     (expand-file-name (concat module-name ".mon") dir)))
-
 (defun monad--parse-exports (file)
   "Return the list of exported symbol names from FILE.
 Each symbol is propertized with the correct `company-kind': `function' or
@@ -1637,11 +1643,41 @@ Each symbol is propertized with the correct `company-kind': `function' or
         (user-error "No docstring for `%s'" name))
       (message "%s" (propertize doc 'face 'font-lock-doc-face)))))
 
+(defun monad-compile-and-run ()
+  "Compile and run current Monad file using compilation mode."
+  (interactive)
+  (unless buffer-file-name
+    (user-error "Buffer is not visiting a file"))
+  (let ((file (file-name-nondirectory buffer-file-name))
+        (exe (file-name-nondirectory (file-name-sans-extension buffer-file-name))))
+    (compile (format "monad %s && ./%s" file exe))))
+
+(defun monad-compile-and-run-tests ()
+  "Compile with --test flag and run current Monad file."
+  (interactive)
+  (unless buffer-file-name
+    (user-error "Buffer is not visiting a file"))
+  (let ((file (file-name-nondirectory buffer-file-name))
+        (exe (file-name-nondirectory (file-name-sans-extension buffer-file-name))))
+    (compile (format "monad --test %s && ./%s" file exe))))
+
+(defun monad-goto-tests ()
+  "Move cursor to the opening parenthesis of the (tests form."
+  (interactive)
+  (goto-char (point-min))
+  (if (re-search-forward "^(tests\\_>" nil t)
+      (goto-char (match-beginning 0))
+    (user-error "No (tests form found in buffer")))
+
 (defvar-keymap monad-mode-map
   :doc "Keymap for Monad mode."
   :parent lisp-mode-shared-map
   ":" #'monad-colon
+  "\\" #'monad-insert-lambda
   "C-c C-d" #'monad-show-docstring
+  "C-c C-c" #'monad-compile-and-run
+  "C-c t" #'monad-compile-and-run-tests
+  "M-g t" #'monad-goto-tests
   "M-," #'monad-xref-go-back)
 
 ;;;###autoload

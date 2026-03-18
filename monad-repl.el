@@ -21,12 +21,18 @@
 ;; - ANSI color support
 
 ;;; TODO [0/1]
-;; - [ ] Make eldoc work also on builtins
+;; - [ ] Apropos to search for functions/variables/modules
 
 ;;; Code:
 
 (require 'comint)
 (require 'ansi-color)
+
+(when (boundp 'nerd-icons-corfu-mapping)
+  (add-to-list 'nerd-icons-corfu-mapping
+               '(c-header :fn (lambda (_cand)
+                                (concat (nerd-icons-faicon "nf-fa-h_square") " "))
+                          :face nerd-icons-purple)))
 
 ;;; Custom variables
 
@@ -77,18 +83,20 @@ provides its own visual separation between inputs)."
   "Face used to highlight error positions in the Monad REPL."
   :group 'monad-repl)
 
+(defface monad-repl-shadow
+  '((t :inherit shadow))
+  "Face used for >>> prompts and separators in the Monad REPL."
+  :group 'monad-repl)
+
 ;;; Internal variables
 
 (defvar monad-repl-prompt-regexp "^Monad \xce\xbb "
   "Regexp to match the Monad REPL prompt.")
 
-;; (defvar monad-repl-prompt-regexp "^Monad λ "
-;;   "Regexp to match the Monad REPL prompt.")
-
 (defvar monad-repl-mode-map
   (let ((map (make-sparse-keymap)))
     (set-keymap-parent map comint-mode-map)
-    (define-key map (kbd "TAB") #'completion-at-point)
+    (define-key map (kbd "TAB") #'monad-repl--tab-command)
     (define-key map (kbd "RET") #'monad-repl-maybe-send)
     (define-key map (kbd "C-x C-n") #'monad-repl--next-error)
     (define-key map (kbd "C-x C-p") #'monad-repl--prev-error)
@@ -174,27 +182,36 @@ provides its own visual separation between inputs)."
 ;;; Multi line editing
 
 (defun monad-repl--nesting-level ()
-  "Return the nesting depth of parens at point relative to the prompt."
+  "Return the nesting depth of parens at point relative to the prompt.
+Skips string literals so quoted parens don't affect the depth count."
   (let* ((proc (get-buffer-process (current-buffer)))
          (pmark (and proc (process-mark proc))))
     (when pmark
       (save-excursion
-        (let ((depth 0))
+        (let ((depth 0)
+              (in-string nil))
           (goto-char pmark)
           (while (< (point) (point-max))
             (let ((ch (char-after)))
-              (cond ((memq ch '(?\( ?\[ ?\{)) (setq depth (1+ depth)))
-                    ((memq ch '(?\) ?\] ?\})) (setq depth (1- depth)))))
+              (cond
+               ;; Toggle string mode on unescaped "
+               ((and (eq ch ?\") (not in-string))
+                (setq in-string t))
+               ((and (eq ch ?\") in-string
+                     (not (eq (char-before) ?\\)))
+                (setq in-string nil))
+               ;; Only count parens outside strings
+               ((not in-string)
+                (cond ((memq ch '(?\( ?\[ ?\{)) (setq depth (1+ depth)))
+                      ((memq ch '(?\) ?\] ?\})) (setq depth (1- depth)))))))
             (forward-char 1))
           depth)))))
 
 (defun monad-repl--newline-and-indent ()
   "Insert newline and indent within a multiline expression."
   (interactive)
-  (save-restriction
-    (narrow-to-region comint-last-input-start (point-max))
-    (insert "\n")
-    (lisp-indent-line)))
+  (insert "\n")
+  (monad-repl--indent-line))
 
 (defun monad-repl-maybe-send ()
   "Send input if balanced and at end, otherwise newline and indent."
@@ -205,13 +222,17 @@ provides its own visual separation between inputs)."
       (monad-repl--newline-and-indent))
      ((= (point) (point-max))
       (let* ((proc  (get-buffer-process (current-buffer)))
-             (pmark (process-mark proc))
-             (input (buffer-substring-no-properties pmark (point-max))))
-        (goto-char (point-max))
-        (insert "\n")
-        (comint-add-to-input-history input)
-        (process-send-string proc (concat input "\n"))
-        (set-marker pmark (point-max))))
+             (pmark (and proc (process-mark proc))))
+        (if (and pmark (> (point-max) pmark))
+            ;; Send the entire accumulated input from pmark to point-max
+            ;; as one string — handles multiline expressions with strings.
+            (let ((input (buffer-substring-no-properties pmark (point-max))))
+              (goto-char (point-max))
+              (insert "\n")
+              (process-send-string proc (concat (string-trim-right input) "\n"))
+              (comint-add-to-input-history (string-trim-right input))
+              (set-marker (process-mark proc) (point-max)))
+          (comint-send-input))))
      (t
       (monad-repl--newline-and-indent)))))
 
@@ -228,6 +249,7 @@ provides its own visual separation between inputs)."
       (insert input)
       (insert "\n")
       (comint-add-to-input-history input)
+      (process-put proc 'monad-repl-busy t)
       (process-send-string proc (concat input "\n"))
       (set-marker (process-mark proc) (point-max)))))
 
@@ -297,7 +319,10 @@ If FILENAME is nil, use the current buffer's file."
 
 (defun monad-repl--send-completion-request (prefix)
   "Send completion request for PREFIX to REPL and return results."
-  (when (and (monad-repl-running-p) prefix)
+  (when (and (monad-repl-running-p) prefix
+             ;; Never send a completion request while the process is
+             ;; busy producing output — the custom filter would swallow it.
+             (not (process-get (monad-repl-process) 'monad-repl-busy)))
     (let* ((proc (monad-repl-process))
            (output "")
            (done nil)
@@ -342,10 +367,12 @@ Returns list of name strings; populates `monad-repl--symbol-table'."
                    (name  (nth 0 parts))
                    (kind  (nth 1 parts))
                    (sig   (nth 2 parts))
-                   (doc   (nth 3 parts)))
+                   (doc   (when-let* ((d (nth 3 parts)))
+                            (replace-regexp-in-string "\\\\n" "\n" d)))
+                   (hdr   (nth 4 parts)))
               (when (and name (not (string-empty-p name)))
                 (push name completions)
-                (puthash name (list kind sig doc)
+                (puthash name (list kind sig doc hdr)
                          monad-repl--symbol-table))))))))
     (nreverse completions)))
 
@@ -399,8 +426,10 @@ Returns (START . END) or nil."
   (when (derived-mode-p 'monad-repl-mode)
     (let* ((line-start (line-beginning-position))
            (before (buffer-substring-no-properties line-start (point))))
-      (unless (string-match "(import +" before)
-        (let ((bounds (monad-repl--completion-bounds)))
+      (unless (or (string-match "\\bimport +" before)
+                  (string-match "\\binclude +" before))
+        (let ((bounds (or (monad-repl--completion-bounds)
+                          (cons (point) (point)))))
           (when bounds
             (let* ((start (car bounds))
                    (end   (cdr bounds)))
@@ -410,9 +439,47 @@ Returns (START . END) or nil."
                        (or (monad-repl--get-completions str) nil)))
                     :exclusive 'no
                     :company-doc-buffer #'ignore
-                    :company-kind #'monad-repl--symbol-kind))))))))
+                    :company-kind #'monad-repl--symbol-kind
+                    :annotation-function
+                    (lambda (cand)
+                      (when-let* ((info (monad-repl--lookup cand))
+                                  (kind (nth 0 info))
+                                  (sig  (nth 1 info)))
+                        (unless (string-empty-p sig)
+                          (if (string= kind "builtin")
+                              (concat " " sig)
+                            (let* ((stripped (replace-regexp-in-string
+                                              (concat "^(" (regexp-quote cand) " *")
+                                              "" sig))
+                                   (stripped (string-trim stripped "(" ")")))
+                              (concat " " stripped))))))))))))))
 
 ;;;; Non protocol completions
+
+(defvar monad-repl--system-headers-cache nil
+  "Cached list of system header paths.")
+
+(defun monad-repl--system-headers ()
+  "Return cached list of C header paths from /usr/include."
+  (or monad-repl--system-headers-cache
+      (let ((root "/usr/include")
+            (headers nil))
+        (dolist (file (directory-files-recursively root "\\.h$"))
+          (push (concat "<" (substring file (1+ (length root))) ">") headers))
+        (setq monad-repl--system-headers-cache (nreverse headers)))))
+
+(defun monad-repl--include-completion-at-point ()
+  "Complete header names after bare 'include'."
+  (when (derived-mode-p 'monad-repl-mode)
+    (let* ((line-start (line-beginning-position))
+           (before (buffer-substring-no-properties line-start (point))))
+      (when (string-match "\\binclude +\\([A-Za-z0-9_./-]*\\)$" before)
+        (let ((start (+ line-start (match-beginning 1)))
+              (end   (+ line-start (match-end 1))))
+          (list start end
+                (monad-repl--system-headers)
+                :exclusive 'yes
+                :company-kind (lambda (_) 'file)))))))
 
 (defun monad-repl--installed-modules ()
   "Return list of installed Monad module names from /usr/local/lib/monad."
@@ -424,25 +491,35 @@ Returns (START . END) or nil."
               modules)))
     (nreverse modules)))
 
-(defun monad-repl--import-completion-at-point ()
-  "Complete module names after (import ."
+(defun monad-repl--special-completion-at-point ()
+  "Complete module names after import, or headers after include."
   (when (derived-mode-p 'monad-repl-mode)
-    ;; Check if we're in an (import ...) context
     (let* ((line-start (line-beginning-position))
            (before (buffer-substring-no-properties line-start (point))))
-      (when (string-match "(import +\\([A-Za-z0-9_]*\\)$" before)
+      (cond
+       ((or (string-match "(import +\\([A-Za-z0-9_]*\\)$" before)
+            (string-match "\\bimport +\\([A-Za-z0-9_]*\\)$" before))
         (let ((start (+ line-start (match-beginning 1)))
               (end   (+ line-start (match-end 1))))
           (list start end
                 (monad-repl--installed-modules)
                 :exclusive 'yes
-                :company-kind (lambda (_) 'module)))))))
+                :company-kind (lambda (_) 'module))))
+       ((string-match "\\binclude +\\(<[A-Za-z0-9_./-]*\\|[A-Za-z0-9_./-]*\\)$" before)
+        (let ((start (+ line-start (match-beginning 1)))
+              (end   (+ line-start (match-end 1))))
+          (list start end
+                (monad-repl--system-headers)
+                :exclusive 'yes
+                :company-kind (lambda (_) 'c-header))))))))
 
 (defun monad-repl--post-self-insert ()
-  "Trigger completion after typing space following (import."
+  "Trigger completion after typing space following (import or bare import."
   (when (and (derived-mode-p 'monad-repl-mode)
              (eq last-command-event ?\s)
-             (looking-back "(import +" (line-beginning-position)))
+             (or (looking-back "(import +" (line-beginning-position))
+                 (looking-back "\\bimport +" (line-beginning-position))
+                 (looking-back "\\binclude +" (line-beginning-position))))
     (completion-at-point)))
 
 ;;; Eldoc
@@ -456,7 +533,6 @@ Returns (START . END) or nil."
   "Propertize SIG string with syntax colours."
   (let ((s (copy-sequence sig))
         (depth 0))
-    ;; Delimiters
     (dotimes (i (length s))
       (let ((ch (aref s i)))
         (cond
@@ -466,32 +542,51 @@ Returns (START . END) or nil."
          ((memq ch '(?\) ?\]))
           (add-face-text-property i (1+ i) (monad-repl--depth-face depth) t s)
           (setq depth (max 0 (1- depth)))))))
-    ;; :: and -> operators
     (let ((i 0))
       (while (string-match "\\(::\\|->\\)" s i)
         (add-face-text-property (match-beginning 0) (match-end 0)
                                 'font-lock-builtin-face t s)
         (setq i (match-end 0))))
+    (let ((i 0))
+      (while (string-match "\\_<_\\_>" s i)
+        (add-face-text-property (match-beginning 0) (match-end 0)
+                                'shadow t s)
+        (setq i (match-end 0))))
     s))
 
 (defun monad-repl--propertize-sig-with-active (sig active-idx)
   "Return SIG propertized with parameter at ACTIVE-IDX highlighted.
-Pass -1 to put all params in default face (hovering the fn name itself)."
+Pass -1 to put all params in default face."
   (let ((s (monad-repl--propertize-sig sig))
         (spans nil)
         (i 0))
+    ;; Named params: [name :: Type]
     (while (string-match "\\[\\([a-z_][A-Za-z0-9_']*\\)[ \t]*::" sig i)
       (push (cons (match-beginning 1) (match-end 1)) spans)
       (setq i (match-end 0)))
-    (setq spans (nreverse spans))
-    (cl-loop for span in spans
-             for idx from 0
-             do (add-face-text-property
-                 (car span) (cdr span)
-                 (if (= idx active-idx)
-                     'font-lock-variable-name-face
-                   'default)
-                 nil s))
+    (if spans
+        ;; Named params path
+        (progn
+          (setq spans (nreverse spans))
+          (cl-loop for span in spans
+                   for idx from 0
+                   do (add-face-text-property
+                       (car span) (cdr span)
+                       (if (= idx active-idx)
+                           'font-lock-variable-name-face
+                         'default)
+                       nil s)))
+      ;; Builtin _ path — highlight each _ slot positionally
+      (let ((i 0) (idx 0))
+        (while (string-match "\\_<_\\_>" s i)
+          (add-face-text-property (match-beginning 0) (match-end 0)
+                                  (if (= idx active-idx)
+                                      'font-lock-variable-name-face
+                                    'shadow)
+                                  nil s)
+          (setq i (match-end 0)
+                idx (1+ idx)))))
+
     s))
 
 (defun monad-repl--point-after-symbol-p ()
@@ -501,7 +596,7 @@ Pass -1 to put all params in default face (hovering the fn name itself)."
          (or (eq syn ?w) (eq syn ?_)))))
 
 (defun monad-repl--point-is-fn-name-p ()
-  "Return non-nil when point is ON the function-name token of a call."
+  "Return non-nil when point is ON the function-name token of a (lisp call)."
   (save-excursion
     (condition-case nil
         (let ((orig (progn
@@ -516,7 +611,7 @@ Pass -1 to put all params in default face (hovering the fn name itself)."
       (error nil))))
 
 (defun monad-repl--point-on-arg-p ()
-  "Return non-nil when point is on a symbol in argument position."
+  "Return non-nil when point is on a symbol in argument position (lisp)."
   (when (symbol-at-point)
     (let* ((sym-start (save-excursion
                         (skip-chars-backward "A-Za-z0-9_'!?$%&*/+<=>.^~-")
@@ -537,7 +632,7 @@ Pass -1 to put all params in default face (hovering the fn name itself)."
       (and fn-end (> sym-start fn-end)))))
 
 (defun monad-repl--current-arg-index ()
-  "Return zero-based argument index at point inside a call form, or nil."
+  "Return zero-based argument index at point inside a (lisp call) form, or nil."
   (save-excursion
     (condition-case nil
         (let ((orig (point)))
@@ -561,7 +656,7 @@ Pass -1 to put all params in default face (hovering the fn name itself)."
       (error nil))))
 
 (defun monad-repl--enclosing-fn-name ()
-  "Return the function name of the enclosing call form, or nil."
+  "Return the function name of the enclosing (lisp call) form, or nil."
   (save-excursion
     (condition-case nil
         (progn
@@ -572,21 +667,113 @@ Pass -1 to put all params in default face (hovering the fn name itself)."
             (match-string-no-properties 0)))
       (error nil))))
 
+;; Haskell-style (no-paren) call detection
+;; For expressions like: sum xs | ap f '(1 2 3)
+(defun monad-repl--haskell-line-start ()
+  "Return the position where Haskell-style scanning should begin.
+That is the process-mark (start of prompt input) if we are inside one,
+otherwise the beginning of the current line."
+  (let* ((proc  (get-buffer-process (current-buffer)))
+         (pmark (and proc (process-mark proc))))
+    (if (and pmark (>= (point) pmark))
+        (marker-position pmark)
+      (line-beginning-position))))
+
+(defun monad-repl--haskell-tokens ()
+  "Return a list of (START . END) for whitespace-separated tokens on
+the current Haskell-style call line, starting from the prompt mark.
+Parenthesised sub-expressions are treated as a single token.
+Returns nil if the line looks like a lisp call (starts with '(')."
+  (save-excursion
+    (let ((lstart (monad-repl--haskell-line-start))
+          tokens)
+      (goto-char lstart)
+      (skip-chars-forward " \t")
+      ;; If the expression starts with '(' it is a lisp call — bail out.
+      (if (eq (char-after) ?\()
+          nil
+        (while (and (not (eolp)) (< (point) (point-max)))
+          (skip-chars-forward " \t")
+          (unless (eolp)
+            (let ((tok-start (point)))
+              (cond
+               ;; Parenthesised / bracketed group — skip as one token
+               ((memq (char-after) '(?\( ?\[ ?\{))
+                (condition-case nil (forward-sexp 1) (error (goto-char (point-max)))))
+               ;; Quoted form
+               ((eq (char-after) ?\')
+                (forward-char 1)
+                (condition-case nil (forward-sexp 1) (error (goto-char (point-max)))))
+               ;; String literal
+               ((eq (char-after) ?\")
+                (condition-case nil (forward-sexp 1) (error (goto-char (point-max)))))
+               ;; Operator / symbol
+               (t
+                (skip-chars-forward "^ \t\n")))
+              (push (cons tok-start (point)) tokens))))
+        (nreverse tokens)))))
+
+(defun monad-repl--haskell-fn-and-arg ()
+  "For a Haskell-style call on the current line, return (FN-NAME . ARG-IDX).
+FN-NAME is the first token that resolves to a known function.
+ARG-IDX is zero-based index of the argument slot at point (not counting the
+function name).  -1 means point is ON the function name itself.
+Returns nil if we are not inside a recognisable Haskell-style call."
+  (catch 'haskell-done
+    (let ((tokens (monad-repl--haskell-tokens)))
+      (unless tokens (throw 'haskell-done nil))
+      (let* ((pt (point))
+             ;; Find the last token whose start is <= pt.
+             ;; That is the token we are "in or just after".
+             ;; We also note whether pt falls strictly inside it.
+             (last-start-idx nil)
+             (point-inside   nil))
+        (cl-loop for (s . e) in tokens
+                 for i from 0
+                 when (<= s pt)
+                 do (setq last-start-idx i
+                          point-inside   (< pt e)))
+        ;; If point is before the very first token, bail.
+        (when (null last-start-idx)
+          (throw 'haskell-done nil))
+        ;; tok-index: which "slot" is point in?
+        ;;   inside token i  -> slot i   (on that token)
+        ;;   past   token i  -> slot i+1 (gap = next argument position)
+        (let ((tok-index (if point-inside
+                             last-start-idx
+                           (1+ last-start-idx))))
+          ;; Walk tokens left-to-right for the first known function.
+          (cl-loop for (s . e) in tokens
+                   for fn-idx from 0
+                   for candidate = (buffer-substring-no-properties s e)
+                   for info = (monad-repl--lookup candidate)
+                   when (and info (member (nth 0 info) '("func" "builtin")))
+                   return (cond
+                           ;; Point is on the function name token itself
+                           ((and point-inside (= fn-idx tok-index))
+                            (cons candidate -1))
+                           ;; Point is on or past an argument token
+                           (t
+                            (let ((arg-idx (- tok-index fn-idx 1)))
+                              (when (>= arg-idx 0)
+                                (cons candidate arg-idx)))))))))))
+
+;;; Lookup / formatting helpers
+
 (defun monad-repl--lookup (name)
   "Return (kind sig doc) for NAME from the symbol table, or nil."
   (and monad-repl--symbol-table
        (gethash name monad-repl--symbol-table)))
 
 (defun monad-repl--format-display-sig (name info)
-  "Return a display string for NAME given INFO (kind sig doc).
-Variables are shown as [name :: Type], functions show their full sig."
+  "Return a display string for NAME given INFO (kind sig doc)."
   (let* ((kind (nth 0 info))
          (sig  (nth 1 info))
          (doc  (nth 2 info))
          (doc-part (when (and doc (not (string-empty-p doc)))
-                     (propertize doc 'face 'font-lock-doc-face))))
+                     (propertize (concat "\"" (car (split-string doc "\n")) "\"")
+                                 'face 'font-lock-doc-face))))
     (cond
-     ;; Variable: [name :: Type]
      ((string= kind "var")
       (let* ((bracket (if (and sig (not (string-empty-p sig)))
                           (format "[%s :: %s]" name sig)
@@ -594,50 +781,63 @@ Variables are shown as [name :: Type], functions show their full sig."
              (s (monad-repl--propertize-sig bracket)))
         (add-face-text-property 1 (1+ (length name))
                                 'font-lock-variable-name-face t s)
-        (concat s (when doc-part (concat " — " doc-part)))))
-     ;; Keyword: just the name
+        (concat s (when doc-part (concat " " (car (split-string doc-part "\n")))))))
      ((string= kind "keyword")
       (propertize name 'face 'font-lock-keyword-face))
-     ;; Builtin: no name in sig, prepend it
      ((string= kind "builtin")
-      (let* ((name-face (propertize name 'face 'font-lock-function-name-face))
-             (sig-part  (when (and sig (not (string-empty-p sig)))
-                          (monad-repl--propertize-sig sig))))
-        (concat name-face
-                (when sig-part (concat " " sig-part))
-                (when doc-part (concat " — " doc-part)))))
-     ;; Func: sig is already "(name [p :: T] -> R)", no need to prepend name
+      (let* ((sig-part (when (and sig (not (string-empty-p sig)))
+                         (monad-repl--propertize-sig
+                          (replace-regexp-in-string "^Fn ?" (concat (upcase-initials name) " ") sig)))))
+        (when sig-part
+          (add-face-text-property 0 (length name) 'font-lock-function-name-face nil sig-part))
+        (concat (or sig-part (propertize name 'face 'font-lock-function-name-face))
+                (when doc-part (concat " " (car (split-string doc-part "\n")))))))
      (t
       (concat (if (and sig (not (string-empty-p sig)))
                   (monad-repl--propertize-sig sig)
                 (propertize name 'face 'font-lock-function-name-face))
-              (when doc-part (concat " — " doc-part)))))))
+              (when doc-part (concat " " (car (split-string doc-part "\n")))))))))
 
 (defun monad-repl--hover-doc (name)
   "Return a propertized eldoc hover string for NAME."
   (when-let* ((info (monad-repl--lookup name)))
     (monad-repl--format-display-sig name info)))
 
+
 (defun monad-repl--call-sig (fn-name arg-idx)
   "Return propertized signature for FN-NAME with ARG-IDX parameter highlighted."
   (when-let* ((info (monad-repl--lookup fn-name))
-              (sig  (nth 1 info))
-              (_ (not (string-empty-p sig))))
-    (let* ((doc      (nth 2 info))
-           (doc-part (when (and doc (not (string-empty-p doc)))
-                       (propertize doc 'face 'font-lock-doc-face))))
-      (concat (monad-repl--propertize-sig-with-active sig arg-idx)
-              (when doc-part (concat " — " doc-part))))))
+              (kind (nth 0 info))
+              (sig  (nth 1 info)))
+    (when (not (string-empty-p sig))
+      (let* ((sig (if (string= kind "builtin")
+                      (replace-regexp-in-string "^Fn" fn-name sig)
+                    sig))
+             (doc      (nth 2 info))
+             (doc-part (when (and doc (not (string-empty-p doc)))
+                         (propertize (concat "\"" (car (split-string doc "\n")) "\"")
+                                     'face 'font-lock-doc-face)))
+             (propertized (monad-repl--propertize-sig-with-active sig arg-idx)))
+        (when (string= kind "builtin")
+          (add-face-text-property 0 (length fn-name)
+                                  'font-lock-function-name-face
+                                  nil propertized))
+        (concat propertized
+                (when doc-part (concat " " doc-part)))))))
 
 (defun monad-repl--eldoc-get-doc ()
   "Return propertized eldoc string for the current context, or nil.
 
 Priority rules:
-  1. Trailing edge of a symbol, not on an argument, not the fn name → nil.
-  2. Point ON the function-name token of a call → full sig, all params dimmed.
-  3. Point ON an argument symbol → hover for that symbol, fallback to call sig.
-  4. Point in a gap inside a call → sig with current param highlighted.
-  5. Fallback: generic hover over any symbol at point."
+  1. Trailing edge of a symbol, not an arg, not the fn name → nil.
+  2. Point ON the function-name token of a (lisp call) → full sig, params dimmed.
+  3. Point ON an argument symbol (lisp) → hover for that symbol, fallback sig.
+  4. Point in a gap inside a (lisp call) → sig with current param highlighted.
+  5. Generic hover over any symbol at point (fallback for lisp).
+  6. NEW — Haskell-style call on current line:
+       point ON fn-name  → full sig, all params dimmed (-1).
+       point ON argument → sig with that arg highlighted.
+       hovering a symbol that is itself a known function → its hover doc."
   (let* ((sym      (symbol-at-point))
          (sym-name (and sym (symbol-name sym))))
     (cond
@@ -647,11 +847,13 @@ Priority rules:
            (not (monad-repl--point-is-fn-name-p))
            (monad-repl--current-arg-index))
       nil)
-     ;; Rule 2: ON the function name → full sig, all params dimmed
+
+     ;; Rule 2: ON the function name of a lisp call → full sig, params dimmed
      ((monad-repl--point-is-fn-name-p)
       (when sym-name
         (monad-repl--call-sig sym-name -1)))
-     ;; Rule 3: ON an argument symbol → hover, fallback to call sig
+
+     ;; Rule 3: ON an argument symbol in a lisp call → hover / call sig
      ((monad-repl--point-on-arg-p)
       (when sym-name
         (or (monad-repl--hover-doc sym-name)
@@ -659,30 +861,60 @@ Priority rules:
                   (fn-name (monad-repl--enclosing-fn-name)))
               (when (and fn-name arg-idx)
                 (monad-repl--call-sig fn-name arg-idx))))))
-     ;; Rule 4: gap inside a call → highlighted parameter
-     (t
+
+     ;; Rule 4: gap inside a lisp call → highlighted parameter
+     ((monad-repl--current-arg-index)
       (let* ((arg-idx (monad-repl--current-arg-index))
              (fn-name (when arg-idx (monad-repl--enclosing-fn-name))))
-        (or (when (and fn-name arg-idx)
-              (monad-repl--call-sig fn-name arg-idx))
-            ;; Rule 5: no call context → generic hover
-            (when sym-name
-              (monad-repl--hover-doc sym-name))))))))
+        (when (and fn-name arg-idx)
+          (monad-repl--call-sig fn-name arg-idx))))
+
+     ;; Rule 5: no lisp call context → try generic hover
+     (sym-name
+      (or (monad-repl--hover-doc sym-name)
+          ;; Rule 6 – Haskell-style call
+          (when-let* ((fa (monad-repl--haskell-fn-and-arg)))
+            (let ((fn-name (car fa))
+                  (arg-idx (cdr fa)))
+              (if (= arg-idx -1)
+                  ;; Point is on the function name itself
+                  (monad-repl--call-sig fn-name -1)
+                (monad-repl--call-sig fn-name arg-idx))))))
+
+     ;; Rule 6 fallback: no symbol at point but still on a Haskell call line
+     (t
+      (when-let* ((fa (monad-repl--haskell-fn-and-arg)))
+        (let ((fn-name (car fa))
+              (arg-idx (cdr fa)))
+          (if (= arg-idx -1)
+              (monad-repl--call-sig fn-name -1)
+            (monad-repl--call-sig fn-name arg-idx))))))))
+
+(defun monad-repl--message-at-window-start (msg &rest args)
+  "Display MSG aligned with left edge of selected window."
+  (message "%s%s"
+           (make-string (floor (window-pixel-left (selected-window))
+                               (max 1 (frame-char-width)))
+                        ?\s)
+           (apply #'format-message msg args)))
 
 (defun monad-repl--eldoc-function (callback &rest _)
-  "Eldoc backend for `monad-repl-mode'.
-CALLBACK is called with the documentation string for the current context."
+  "Eldoc backend for `monad-repl-mode'."
   (when (monad-repl-running-p)
     (when-let* ((doc (monad-repl--eldoc-get-doc)))
-      (funcall callback doc)
-      t)))
+      (let ((aligned-doc (with-temp-buffer
+                           (monad-repl--message-at-window-start doc)
+                           (buffer-string))))
+        (funcall callback aligned-doc)
+        t))))
 
 ;;; ERROR Buttonization
 
 (defun monad-repl--buttonize-errors (output)
   "Buttonize <input>:LINE:COL: error: lines in OUTPUT like `compilation-mode'."
   (let ((result output))
-    (when (string-match "<input>:\\([0-9]+\\):\\([0-9]+\\):\\([^\n]*\\)" output)
+    (when (and (string-search "<input>:" output)
+               (string-match "<input>:\\([0-9]+\\):\\([0-9]+\\):\\([^\n]*\\)" output))
       (let* ((line       (string-to-number (match-string 1 output)))
              (col        (string-to-number (match-string 2 output)))
              (rest       (match-string 3 output))
@@ -692,16 +924,19 @@ CALLBACK is called with the documentation string for the current context."
                            (define-key map [mouse-1] #'monad-repl--jump-to-error)
                            (define-key map (kbd "RET") #'monad-repl--jump-to-error)
                            map))
-             (props      `(monad-repl-error-line ,line
+         (props      `(monad-repl-error-line ,line
                            monad-repl-error-col  ,col
                            mouse-face            highlight
                            help-echo             "mouse-1: go to error position"
-                           keymap                ,keymap)))
+                           keymap                ,keymap))
+         (error-type (if (string-match "warning" (match-string 3 output))
+                        'compilation-warning
+                      'compilation-error)))
         (setq result
               (concat
                (substring output 0 full-start)
                (apply #'propertize "<input>"
-                      'face '(compilation-error :underline t) props)
+                      'face (list error-type :underline t) props)
                (apply #'propertize ":"
                       'face '(:underline t) props)
                (apply #'propertize (number-to-string line)
@@ -765,6 +1000,12 @@ Like `pulse' but interpolates both foreground and background."
       (forward-line (1- line))
       (beginning-of-line)
       (forward-char (1- col))
+      ;; Skip past comment lines and blank lines to find real code
+      (while (and (not (eobp))
+                  (or (looking-at "^\\s-*$")          ; blank line
+                      (looking-at "^\\s-*;")))        ; comment line
+        (forward-line 1)
+        (beginning-of-line))
       (skip-chars-forward "^A-Za-z0-9_'!?$%&*/+<=>.^~-")
       (let* ((beg (point))
              (end (save-excursion
@@ -830,7 +1071,8 @@ Like `pulse' but interpolates both foreground and background."
 
 (defun monad-repl--ansi-color-filter (string)
   "Filter ANSI color codes from STRING."
-  (ansi-color-apply string))
+  (let ((inhibit-read-only t))
+    (ansi-color-apply string)))
 
 (defun monad-repl--setup-ansi-colors ()
   "Set up ANSI color support for the REPL."
@@ -883,6 +1125,24 @@ BEG and END are the region boundaries."
   "Find definitions of SYMBOL, checking open buffers first then core."
   (require 'xref)
   (let (results)
+    ;; 0. FFI symbol — jump directly to the C header
+    (let* ((info (monad-repl--lookup symbol))
+           (hdr  (and info (nth 3 info))))
+      (when (and hdr (not (string-empty-p hdr)) (file-exists-p hdr))
+        (with-current-buffer (find-file-noselect hdr)
+          (save-excursion
+            (goto-char (point-min))
+            (let* ((c-types-re "\\(?:void\\|int\\|unsigned\\|char\\|float\\|double\\|long\\|short\\|bool\\|size_t\\|uint\\(?:8\\|16\\|32\\|64\\)_t\\|int\\(?:8\\|16\\|32\\|64\\)_t\\|RLAPI\\s-+\\w+\\|RLAPI\\)")
+                   (sym-re (regexp-quote symbol))
+                   (declaration-re (concat "^[^*\n]*" c-types-re "\\s-+" sym-re "\\s-*("))
+                   (fallback-re    (concat "^[^*\n]*[A-Z]\\w+\\s-+" sym-re "\\s-*(")))
+              (or (re-search-forward declaration-re nil t)
+                  (re-search-forward fallback-re nil t))
+              (push (xref-make symbol
+                               (xref-make-buffer-location
+                                (current-buffer)
+                                (match-beginning 0)))
+                    results))))))
     ;; 1. Search all open monad-mode buffers first
     (dolist (buf (buffer-list))
       (with-current-buffer buf
@@ -972,11 +1232,62 @@ BEG and END are the region boundaries."
       output
     (concat output "\n")))
 
+(defun monad-repl--indent-line ()
+  "Indent current line in the REPL prompt with 2-space indentation."
+  (let* ((proc (get-buffer-process (current-buffer)))
+         (pmark (and proc (process-mark proc))))
+    (when (and pmark (>= (point) pmark))
+      (let ((pos (- (point-max) (point))))
+        (beginning-of-line)
+        (when (> (point) pmark)
+          (let ((indent (save-excursion
+                          (condition-case nil
+                              (progn
+                                (up-list -1)
+                                (+ (current-column) 2))
+                            (error 0)))))
+            (delete-horizontal-space)
+            (indent-to indent)))
+        (when (> (- (point-max) pos) (point))
+          (goto-char (- (point-max) pos)))))))
+
+(defun monad-repl--tab-command ()
+  "Indent line or complete. If already indented, show all completions."
+  (interactive)
+  (let* ((col (current-column))
+         (expected (save-excursion
+                     (monad-repl--indent-line)
+                     (current-column))))
+    (if (= col expected)
+        ;; Already at correct indentation — complete with empty prefix
+        (let ((bounds (monad-repl--completion-bounds)))
+          (if bounds
+              (completion-at-point)
+            ;; No symbol at point — force all completions
+            (let ((monad-repl--force-all-completions t))
+              (completion-at-point))))
+      ;; Not yet indented — indent
+      (monad-repl--indent-line))))
+
 (define-derived-mode monad-repl-mode comint-mode "Monad-REPL"
   "Major mode for interacting with a Monad REPL.
 
 \\{monad-repl-mode-map}"
   :group 'monad-repl
+
+  ;; Define comment syntax explicitly
+  (modify-syntax-entry ?\; "<" (syntax-table))  ; ; starts comment
+  (modify-syntax-entry ?\n ">" (syntax-table))  ; newline ends comment
+  (modify-syntax-entry ?\r ">" (syntax-table))  ; carriage return ends comment
+
+  ;; TODO Add syntax highlighting for >>>
+  ;; Add explicit comment font-lock rules
+  (setq-local font-lock-defaults
+              '((("\\(;.*\\)$" . font-lock-comment-face)
+                 ;; Include other font-lock rules from monad-mode if needed
+                 )
+                nil nil nil nil
+                (font-lock-comment-face . font-lock-comment-face)))
 
   ;; Comint settings
   (setq-local comint-prompt-regexp monad-repl-prompt-regexp)
@@ -989,16 +1300,15 @@ BEG and END are the region boundaries."
   (setq-local comint-input-ignoredups t)
   (setq-local comint-input-ring-size 1000)
 
-  ;; Disable indentation
-  (setq-local indent-line-function #'ignore)
-  (setq-local tab-always-indent nil)
+  (setq-local indent-line-function #'monad-repl--indent-line)
+  (setq-local tab-always-indent 'complete)
 
   ;; Initialize completion cache
   (setq monad-repl--completion-cache (make-hash-table :test 'equal))
 
   ;; Set up completion
   (add-hook 'completion-at-point-functions
-            #'monad-repl--import-completion-at-point nil t)
+            #'monad-repl--special-completion-at-point nil t)
 
   (add-hook 'completion-at-point-functions
             #'monad-repl-completion-at-point nil t)
@@ -1033,6 +1343,10 @@ BEG and END are the region boundaries."
               #'monad-repl--wrap-fontify-region)
   (setq-local font-lock-unfontify-region-function
               #'monad-repl--wrap-unfontify-region)
+  ;; Limit font-lock to avoid hanging on large output blocks
+  (setq-local font-lock-maximum-size nil)
+  (setq-local jit-lock-chunk-size 500)
+
 
   ;; Xref
   (add-hook 'xref-backend-functions #'monad-repl-xref-backend nil t)
@@ -1063,10 +1377,10 @@ This should be called from `monad-mode' initialization."
     (define-key monad-mode-map (kbd "C-c C-z") #'monad-repl)
     (define-key monad-mode-map (kbd "C-c C-r") #'monad-repl-eval-region)
     (define-key monad-mode-map (kbd "C-c C-b") #'monad-repl-eval-buffer)
-    (define-key monad-mode-map (kbd "C-c C-e") #'monad-repl-eval-defun)
+    (define-key monad-mode-map (kbd "C-x C-h") #'monad-repl-eval-defun)
     (define-key monad-mode-map (kbd "C-x C-e") #'monad-repl-eval-last-sexp)
     (define-key monad-mode-map (kbd "C-c C-l") #'monad-repl-load-file)
-    (define-key monad-mode-map (kbd "C-c C-c C-r") #'monad-repl-restart)))
+    (define-key monad-mode-map (kbd "C-c C-r") #'monad-repl-restart)))
 
 ;;;###autoload
 (defun monad-repl-setup-hooks ()

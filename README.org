@@ -8,5 +8,6 @@ Major-mode for the monad programming language
   :ensure t
   :config
   (setq monad-highlight-arrow nil)     ; Highlight the -> arrow with keyword face (default: nil)
-  (setq monad-infix-hide-backticks t)) ; Hide the surrounding backticks of infix expressions like `+` (default: t)
+  (setq monad-infix-hide-backticks t)  ; Hide the surrounding backticks of infix expressions like `+` (default: t)
+  (setq monad-repl-show-prompt t))     ; Show the Monad λ prompt (default: t)
 #+end_src
