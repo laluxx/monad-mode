@@ -42,13 +42,6 @@
 ;;   - Scheme-compatible indentation via `scheme-indent-function'
 ;;   - Dedicated indentation for (asm ...) blocks
 ;;
-;; Infix expressions
-;;   - Backtick infix calls (`fun`) highlighted with a distinct face
-;;   - Optional backtick hiding: only the operator name is shown
-;;     (see `monad-infix-hide-backticks')
-;;   - Operator characters (+, -, *, / ...) are auto-wrapped in backticks
-;;     when typed in infix position
-;;
 ;; Assembly
 ;;   - Full syntax highlighting inside (asm ...) forms: instructions,
 ;;     registers, labels, directives, and numeric literals
@@ -78,7 +71,17 @@
 ;;   - Electric backtick pairing via `electric-pair-mode'
 ;;   - `C-c C-d' shows the full docstring of the symbol at point
 
-;;; TODO [0/1]
+;;; TODO [0/10]
+;; - [ ] if there is [any|thing] on RET indent the guard to be aligned with the |
+;; - [ ] an option to indent the -> even before the guards at the top
+;; - [ ] Make `mark-sep' work with wisp too
+;; - [ ] a function to automatically insert the (module Name [...])
+;; - [ ] t to monad-type-infer-region
+;; - [ ] i to monad-parinfer-region
+;; - [ ] smart [] also for function parameters
+;; - [ ] Completion should work with wisp too
+;; - [ ] we should highlight `color' with the `font-lock-variable-name-face' `'define color Color 33 33 33 0
+;; - [ ] Highlight `tmp' with `font-lock-variable-name-face' (let [tmp (arr i)] ...)
 ;; - [ ] "include <" should complete with C libraries
 ;; - [ ] If There is a repl we could also know the type of stuff
 ;;       in eldoc in monad-mode.
@@ -104,19 +107,6 @@
   "If non-nil, highlight the -> arrow with keyword face."
   :type 'boolean
   :group 'monad)
-
-(defcustom monad-infix-hide-backticks t
-  "If non-nil, hide the surrounding backticks of infix function calls.
-Only the function name is shown, colored with `monad-infix-face'.
-The backticks become visible again when point is inside the expression."
-  :type 'boolean
-  :group 'monad
-  :set (lambda (symbol value)
-         (set-default symbol value)
-         (dolist (buf (buffer-list))
-           (with-current-buffer buf
-             (when (derived-mode-p 'monad-mode)
-               (font-lock-flush))))))
 
 (defface monad-underscore-face
   '((t :inherit shadow))
@@ -167,9 +157,6 @@ The backticks become visible again when point is inside the expression."
     (modify-syntax-entry ?\" "\"   " st)
     ;; Character quote
     (modify-syntax-entry ?' "'   " st)
-    ;; Backtick: symbol constituent so it doesn't interfere with
-    ;; Lisp quasiquote logic and electric-pair can handle it cleanly
-    (modify-syntax-entry ?` "_   " st)
     ;; Special characters
     (modify-syntax-entry ?, "'   " st)
     (modify-syntax-entry ?@ "'   " st)
@@ -182,12 +169,13 @@ The backticks become visible again when point is inside the expression."
 (define-abbrev-table 'monad-mode-abbrev-table ())
 
 (defconst monad-keywords
-  '("define" "lambda" "match" "layout" "type" "data" "deriving"
-    "let" "letrec" "let*" "if" "cond" "case" "else"
+  '("define" "def" "lambda" "match" "with" "layout" "type" "data" "deriving"
+    "let" "letrec" "let*" "cond" "case" "if" "then" "else"
     "and" "or" "not" "quote" "unquote" "quasiquote"
     "begin" "when" "unless" "error" "instance" "asm"
     "module" "import" "qualified" "hiding" "tests" "test"
-    "take" "drop" "include" "until")
+    "take" "drop" "include" "for" "while" "mod" "class"
+    "where" "show" "set!" "set" "otherwise")
   "Keywords for the Monad programming language.")
 
 ;;; Imenu — flat index with cached docstring annotations
@@ -416,80 +404,38 @@ leaving any `invisible' properties set by other modes (e.g. `porg-mode') intact.
     (setq-local electric-pair-text-pairs
                 (append electric-pair-text-pairs '((?` . ?`))))))
 
-;;;; Infix operator auto-wrapping
-;;
-;; When the user types an operator character (+, -, *, /, etc.) and the token
-;; immediately to the left is NOT preceded by "(" (i.e. we are not already
-;; inside a normal prefix call), automatically wrap the operator in backticks.
-;;
-;; Example:
-;;   (x + y)        -- "x" is preceded by "(", so the + is left alone.
-;;   new-players + players  -- "new-players" is NOT preceded by "(",
-;;                             so + becomes `+``` automatically.
-
-(defconst monad-infix-operator-chars
-  '(?+ ?- ?* ?/ ?% ?< ?> ?= ?& ?| ?^ ?~ ?!)
-  "Characters that trigger infix auto-wrapping when typed as a bare operator.
-Only single-character operator chars are checked here.")
-
-(defun monad--infix-auto-wrap-p ()
-  "Return non-nil when the operator just typed should be wrapped in backticks.
-Checks that point is not in an asm block, string, or comment, that the
-character just inserted is in `monad-infix-operator-chars', that
-electric-pair has not already inserted a closing backtick, and that the
-token to the left is not preceded by `(' which would make this a prefix
-call head rather than an infix operator."
-  (and (not (monad-in-asm-form-p))
-       (not (nth 3 (syntax-ppss)))
-       (not (nth 4 (syntax-ppss)))
-       (> (point) 2)
-       (memq (char-before) monad-infix-operator-chars)
-       ;; Don't wrap if electric-pair already inserted a closing backtick
-       (not (eq (char-after) ?`))
-       (save-excursion
-         (backward-char 1)
-         (skip-chars-backward " \t")
-         (not (eq (char-before) ?\()))))
-
-(defun monad--infix-do-wrap ()
-  "Wrap the operator just typed in backticks.
-Transforms `...lhs OP' into `...lhs `OP`', leaving point after the
-closing backtick ready to type the RHS."
-  (let ((op-end (point)))
-    (save-excursion
-      (backward-char 1)
-      (insert "`"))
-    ;; op-end is now off by one due to the inserted backtick
-    (goto-char (1+ op-end))
-    (insert "`")))
-
 ;; Assembly syntax highlighting support
-
 (defun monad-syntax-propertize (start end)
   "Apply syntax properties from START to END."
   (goto-char start)
   (funcall
    (syntax-propertize-rules
+    ;; Character literals: mark the surrounding single quotes as string delimiters
+    ;; This hides `"` and `(` inside character literals from Emacs's structural parser.
+    ("\\('\\)\\(?:\\\\.\\|[^'\\]\\)\\('\\)"
+     (1 "\"")
+     (2 "\""))
     ("(\\s-*\\(asm\\)\\_>"
      (0 (ignore
          (let* ((asm-start (match-beginning 0))
                 (asm-keyword-end (match-end 0))
                 (asm-end (save-excursion
-                          (goto-char asm-start)
-                          (condition-case nil
-                              (progn (forward-sexp 1) (1- (point)))
-                            (error nil)))))
+                           (goto-char asm-start)
+                           (condition-case nil
+                               (progn (forward-sexp 1) (1- (point)))
+                             (error nil)))))
            (when asm-end
              (put-text-property asm-keyword-end asm-end 'monad-asm-region t))
            nil)))))
    start end))
 
 (defun monad-font-lock-extend-region ()
-  "Extend font-lock region to cover complete asm forms."
+  "Extend font-lock region to cover complete asm forms and block comments."
   (defvar font-lock-beg)
   (defvar font-lock-end)
   (let ((changed nil))
     (save-excursion
+      ;; Extend for asm forms
       (goto-char font-lock-beg)
       (when (monad-in-asm-form-p)
         (let ((start (previous-single-property-change (point) 'monad-asm-region)))
@@ -503,7 +449,29 @@ closing backtick ready to type the RHS."
         (let ((end (next-single-property-change (point) 'monad-asm-region)))
           (when end
             (setq font-lock-end (1+ end)
-                  changed t)))))
+                  changed t))))
+      ;; Extend for -| ... |- block comments
+      ;; If font-lock-beg is inside a block comment, pull beg back to the -|
+      (goto-char font-lock-beg)
+      (let ((search-start (max (point-min) (- font-lock-beg 10000))))
+        (save-excursion
+          (when (re-search-backward "-|" search-start t)
+            (let ((open (point)))
+              (save-excursion
+                (goto-char (+ open 2))
+                (let ((close (search-forward "|-" nil t)))
+                  (when (and close (> close font-lock-beg))
+                    (setq font-lock-beg open
+                          changed t))))))))
+      ;; If font-lock-end is inside a block comment, push end forward to the |-
+      (save-excursion
+        (goto-char font-lock-beg)
+        (while (re-search-forward "-|" font-lock-end t)
+          (let ((after-open (point)))
+            (let ((close (save-excursion (search-forward "|-" nil t))))
+              (when (and close (> close font-lock-end))
+                (setq font-lock-end close
+                      changed t)))))))
     changed))
 
 (defun monad-in-asm-form-p (&optional pos)
@@ -525,8 +493,8 @@ closing backtick ready to type the RHS."
                       (current-column)
                     (+ (progn (goto-char (match-beginning 0))
                               (current-column))
-                       5)))
-              (error 7)))))
+                       2))) ; Changed from 5 to 2
+              (error 2))))) ; Changed from 7 to 2
     (save-excursion
       (beginning-of-line)
       (skip-chars-forward " \t")
@@ -540,12 +508,380 @@ closing backtick ready to type the RHS."
 (defun monad-indent-line ()
   "Indent current line."
   (interactive)
-  (if (monad-in-asm-form-p)
-      (monad-asm-indent-line)
-    (lisp-indent-line)))
+  (cond
+   ((monad-in-asm-form-p)
+    (monad-asm-indent-line))
+   ;; Inside a paragraph comment -> match indentation of the -| opening line + 3
+   ((save-excursion
+      (catch 'in-para
+        (while (not (bobp))
+          (forward-line -1)
+          (cond
+           ((looking-at "^$")  (throw 'in-para nil))
+           ((looking-at "^-|")
+            (throw 'in-para
+                   (not (string-match-p "|-" (buffer-substring-no-properties
+                                              (line-beginning-position)
+                                              (line-end-position))))))
+           ((looking-at "^\\s-+") nil)  ; continue searching
+           (t (throw 'in-para nil))))
+        nil))
+    ;; Inside a paragraph comment -> match indentation of the -| opening line + 3
+    (let* ((old-col (current-column))
+           (old-indent (current-indentation))
+           (para-indent (save-excursion
+                          (catch 'found
+                            (while (not (bobp))
+                              (forward-line -1)
+                              (when (looking-at "^-|")
+                                (throw 'found (+ (current-indentation) 3))))
+                            3))))
+      (save-excursion
+        (beginning-of-line)
+        (delete-horizontal-space)
+        (indent-to para-indent))
+      (move-to-column (max para-indent (+ para-indent (- old-col old-indent))))))
+   ;; Previous non-blank line closes a top-level sexp -> go to col 0
+   ((save-excursion
+      (forward-line -1)
+      (while (and (not (bobp)) (looking-at "^\\s-*$"))
+        (forward-line -1))
+      (end-of-line)
+      (and (eq (char-before) ?\))
+           (condition-case nil
+               (progn
+                 (backward-sexp)
+                 (and (= (current-column) 0)
+                      (= (car (syntax-ppss)) 0)))
+             (error nil))))
+    (save-excursion
+      (beginning-of-line)
+      (delete-horizontal-space))
+    (beginning-of-line))
+   ;; Current line starts with define -> always top-level, no indent
+   ((save-excursion
+      (beginning-of-line)
+      (looking-at "^\\s-*define\\s-+"))
+    (save-excursion
+      (beginning-of-line)
+      (delete-horizontal-space))
+    (beginning-of-line))
+   ;; Previous non-blank line is a wisp variable define (no ->) -> no indent
+   ((save-excursion
+      (forward-line -1)
+      (while (and (not (bobp)) (looking-at "^\\s-*$"))
+        (forward-line -1))
+      (and (looking-at "^define\\s-+")
+           (not (string-match-p "->" (buffer-substring-no-properties
+                                      (line-beginning-position)
+                                      (line-end-position))))))
+    (save-excursion
+      (beginning-of-line)
+      (delete-horizontal-space))
+    (beginning-of-line))
+   ;; Previous non-blank line is a bare define header -> indent to 2
+   ((save-excursion
+      (forward-line -1)
+      (while (and (not (bobp)) (looking-at "^\\s-*$"))
+        (forward-line -1))
+      (looking-at "^define\\s-+"))
+    (let* ((old-col (current-column))
+           (old-indent (current-indentation)))
+      (save-excursion
+        (beginning-of-line)
+        (delete-horizontal-space)
+        (indent-to 2))
+      (move-to-column (max 2 (+ 2 (- old-col old-indent))))))
+   ;; Previous non-blank line is an indented wisp body line -> match its indent
+   ;; but NOT if it's inside a paragraph comment (blank line separates us)
+   ((save-excursion
+      (and
+       ;; There must be no blank line between us and the previous indented line
+       (progn (forward-line -1) (not (looking-at "^$")))
+       (progn
+         (while (and (not (bobp)) (looking-at "^\\s-*$"))
+           (forward-line -1))
+         (and (looking-at "^\\s-+")
+              (not (looking-at "^("))))))
+    (let* ((old-col (current-column))
+           (old-indent (current-indentation))
+           (prev-indent (save-excursion
+                          (forward-line -1)
+                          (while (and (not (bobp)) (looking-at "^\\s-*$"))
+                            (forward-line -1))
+                          (current-indentation))))
+      (save-excursion
+        (beginning-of-line)
+        (delete-horizontal-space)
+        (indent-to prev-indent))
+      (move-to-column (max prev-indent (+ prev-indent (- old-col old-indent))))))
+   (t
+    (lisp-indent-line))))
+
+(defun monad-insert-set-member ()
+  "Replace space with ∈ when inside a set comprehension and preceded by space."
+  (when (and (eq (char-before) ?\s)
+             (save-excursion
+               (backward-char 1)
+               (and (eq (char-before) ?\s)
+                    (condition-case nil
+                        (save-excursion (up-list -1) (eq (char-after) ?{))
+                      (error nil)))))
+    (delete-char -1)
+    (insert "∈ ")))
+
+(defun monad-insert-type-annotation ()
+  "Insert ':: ' when typing a space inside [].
+- Inside a layout block: trigger on single space after a word character.
+- Otherwise: trigger on double space.
+Aligns ':: ' to match the column of ':: ' on the previous line if present,
+pushes previous lines right if the current name is longer, and cleans up
+excess whitespace to the right."
+  (when (save-excursion
+          (backward-char 1)
+          (condition-case nil
+              (save-excursion (up-list -1) (eq (char-after) ?\[))
+            (error nil)))
+    (let* ((in-layout
+            (save-excursion
+              (catch 'found
+                (condition-case nil
+                    (while t
+                      (up-list -1)
+                      (when (and (eq (char-after) ?\()
+                                 (save-excursion
+                                   (forward-char 1)
+                                   (skip-chars-forward " \t\n")
+                                   (looking-at "layout\\_>")))
+                        (throw 'found t)))
+                  (error nil)))))
+           (triggered
+            (if in-layout
+                (and (eq (char-before) ?\s)
+                     (save-excursion
+                       (backward-char 1)
+                       (memq (char-syntax (char-before)) '(?w ?_))))
+              (and (eq (char-before) ?\s)
+                   (save-excursion
+                     (backward-char 1)
+                     (eq (char-before) ?\s))))))
+      (when triggered
+        (let ((target-col
+               (save-excursion
+                 (forward-line -1)
+                 (when (re-search-forward "::" (line-end-position) t)
+                   (- (match-beginning 0) (line-beginning-position))))))
+
+          (delete-char (if in-layout -1 -2))
+
+          (if target-col
+              (let* ((base-col (current-column))
+                     (required-col (+ base-col 1)))
+                (if (< target-col required-col)
+                    (let ((shift (- required-col target-col)))
+                      (save-excursion
+                        (forward-line -1)
+                        (while (and (>= (point) (point-min))
+                                    (save-excursion
+                                      (beginning-of-line)
+                                      (let ((match (re-search-forward "::" (line-end-position) t)))
+                                        (and match (= (- (match-beginning 0) (line-beginning-position)) target-col)))))
+                          (save-excursion
+                            (beginning-of-line)
+                            (re-search-forward "::" (line-end-position) t)
+                            (goto-char (match-beginning 0))
+                            (insert (make-string shift ?\s)))
+                          (forward-line -1)))
+                      (insert " :: "))
+                  (let ((padding (- target-col base-col)))
+                    (insert (make-string padding ?\s) ":: "))))
+            (insert " :: "))
+
+          ;; NEW: Vacuum up whitespace to the right
+          (delete-region (point)
+                         (save-excursion
+                           (skip-chars-forward " \t")
+                           (point))))))))
+
+(defun monad--count-sexps (start end)
+  "Count complete sexps between START and END."
+  (save-excursion
+    (goto-char start)
+    (let ((count 0))
+      (while (condition-case nil
+                 (progn (forward-sexp 1) (<= (point) end))
+               (error nil))
+        (setq count (1+ count)))
+      count)))
+
+
+;; TODO We could also show eldoc showing the current param we are binding in pmatch before ->
+(defun monad-insert-arrow-annotation ()
+  "Insert '-> ' when typing a space after the last expected pattern sexp.
+Dynamically counts expected parameters from peer lines or parent signature,
+and aligns '-> ' to match previous lines. Handles type signatures and guards automatically."
+  (when (and (eq (char-before) ?\s)
+             ;; Prevent triggering if the user manually typed "-> "
+             (not (and (>= (point) 3)
+                       (string= (buffer-substring-no-properties (- (point) 3) (1- (point))) "->")))
+             ;; Ensure we are exactly after a sexp
+             (save-excursion
+               (backward-char 1)
+               (let ((end-of-sexp (point)))
+                 (beginning-of-line)
+                 (skip-chars-forward " \t")
+                 (condition-case nil
+                     (progn
+                       ;; Move forward until we pass end-of-sexp to verify it's a boundary
+                       (while (< (point) end-of-sexp)
+                         (forward-sexp 1))
+                       (= (point) end-of-sexp))
+                   (error nil)))))
+
+    ;; Determine context
+    (let* ((line-beg (line-beginning-position))
+           (line-str (buffer-substring-no-properties line-beg (line-end-position)))
+           (text-before (string-trim-right (buffer-substring-no-properties line-beg (1- (point)))))
+           (is-type-sig (or (string-match-p "^\\s-*define\\s-+\\(?:\\sw\\|\\s_\\)+\\s-+::" line-str)
+                            (string-match-p "^\\s-*::" line-str)))
+           (is-guard-line (string-match-p "^\\s-*|\\s-*" line-str)))
+
+      (if (and is-type-sig (not (string-suffix-p "::" text-before)))
+          ;; FAST PATH: Just insert the arrow, no counting or alignment needed.
+          ;; (Bypassed if the token right before the space was "::")
+          (progn
+            (delete-char -1)
+            (insert " -> ")
+            (delete-region (point)
+                           (save-excursion
+                             (skip-chars-forward " \t")
+                             (point))))
+
+        ;; REGULAR PATH: Pattern matching parameter counting, guards, and alignment
+        ;; Prevent insertion if an arrow already exists on this line!
+        (unless (or is-type-sig (string-match-p "\\s-->\\(?:\\s-\\|\\'\\)" text-before))
+          (let* ((current-sexp-count (monad--count-sexps line-beg (1- (point))))
+                 (current-indent (save-excursion (beginning-of-line) (current-indentation)))
+                 (expected-sexps nil)
+                 (target-col nil)
+                 (trigger-insert nil))
+
+            (save-excursion
+              (catch 'found
+                (while (not (bobp))
+                  (forward-line -1)
+                  (cond
+                   ((looking-at "^\\s-*$") nil)
+                   ((looking-at "^\\s-*\"") nil)
+                   ((looking-at "^\\s-*;") nil)
+                   ((= (current-indentation) current-indent)
+                    ;; Peer line: count sexps before the arrow
+                    (when (re-search-forward "\\s-->" (line-end-position) t)
+                      (let ((arrow-start (- (match-end 0) 2)))
+                        (unless is-guard-line
+                          (setq expected-sexps (monad--count-sexps (line-beginning-position) arrow-start)))
+                        (setq target-col (save-excursion (goto-char arrow-start) (current-column)))
+                        (throw 'found t))))
+                   ((< (current-indentation) current-indent)
+                    ;; Parent line: parse header to find expected parameters
+                    (beginning-of-line)
+                    (if is-guard-line
+                        (throw 'found t) ; Guards don't inherit expected-sexps from parent
+                      (cond
+                       ((looking-at "^\\s-*\\(?:match\\|case\\)\\_>")
+                        (setq expected-sexps 1)
+                        (throw 'found t))
+                       ((looking-at "^\\s-*define\\s-+\\(?:\\sw\\|\\s_\\)+\\s-+::")
+                        ;; Haskell style: define name :: A -> B -> C
+                        (re-search-forward "::")
+                        (let ((count 0) (limit (line-end-position)))
+                          (while (re-search-forward "->" limit t)
+                            (when (= (car (syntax-ppss)) 0) (setq count (1+ count))))
+                          (setq expected-sexps (max 1 count)))
+                        (throw 'found t))
+                       ((looking-at "^\\s-*(define\\s-+(")
+                        ;; Lisp style: (define (name p1 p2) or (define (name . Int -> Int)
+                        (let ((count 0))
+                          (condition-case nil
+                              (progn
+                                (down-list 1) (forward-sexp 1)
+                                (down-list 1) (forward-sexp 1)
+                                (skip-chars-forward " \t")
+                                (while (not (or (looking-at "\\.") (looking-at "->") (looking-at ")")))
+                                  (forward-sexp 1)
+                                  (skip-chars-forward " \t")
+                                  (setq count (1+ count))))
+                            (error nil))
+                          (if (= count 0)
+                              (progn
+                                (beginning-of-line)
+                                (let ((arrow-count 0))
+                                  (while (re-search-forward "->" (line-end-position) t)
+                                    (setq arrow-count (1+ arrow-count)))
+                                  (setq expected-sexps (max 1 arrow-count))))
+                            (setq expected-sexps count)))
+                        (throw 'found t))
+                       (t
+                        (setq expected-sexps 1)
+                        (throw 'found t)))))))))
+
+            ;; Evaluate if we should trigger the arrow insertion
+            (if is-guard-line
+                (let* ((guard-expr-start (save-excursion
+                                           (beginning-of-line)
+                                           (re-search-forward "^\\s-*|\\s-*" (line-end-position) t)
+                                           (point)))
+                       (guard-str (string-trim (buffer-substring-no-properties guard-expr-start (1- (point))))))
+                  ;; Smarter Guard Heuristic: 'otherwise', '(...)', or contains a comparison operator WITH a right-hand operand
+                  (when (or (string= guard-str "otherwise")
+                            (string-prefix-p "(" guard-str)
+                            (string-match-p "\\(?:\\`\\|\\s-\\)\\(?:=\\|<=\\|!=\\|>=\\|<\\|>\\)\\s-+\\S-" guard-str))
+                    (setq trigger-insert t)))
+              (when (and expected-sexps (= current-sexp-count expected-sexps))
+                (setq trigger-insert t)))
+
+            ;; Execute insertion and alignment
+            (when trigger-insert
+              (delete-char -1) ; remove trigger space
+              (if (numberp target-col)
+                  (let* ((base-col (current-column))
+                         (required-col (+ base-col 1)))
+                    (if (< target-col required-col)
+                        ;; 1. Current pattern is longer. Push previous line(s) right.
+                        (let ((shift (- required-col target-col)))
+                          (save-excursion
+                            (forward-line -1)
+                            (while (and (>= (point) (point-min))
+                                        (save-excursion
+                                          (beginning-of-line)
+                                          (let ((match (re-search-forward "\\s-->" (line-end-position) t)))
+                                            (and match
+                                                 (save-excursion
+                                                   (goto-char (- (match-end 0) 2))
+                                                   (= (current-column) target-col))))))
+                              (save-excursion
+                                (beginning-of-line)
+                                (re-search-forward "\\s-->" (line-end-position) t)
+                                (goto-char (- (match-end 0) 2))
+                                (insert (make-string shift ?\s)))
+                              (forward-line -1)))
+                          (insert " -> "))
+                      ;; 2. Previous pattern is longer or equal. Pad the current line.
+                      (let ((padding (- target-col base-col)))
+                        (insert (make-string padding ?\s) "-> "))))
+                ;; 3. No previous line to align to (first pattern arm)
+                (insert " -> "))
+              ;; Vacuum up whitespace to the right
+              (delete-region (point)
+                             (save-excursion
+                               (skip-chars-forward " \t")
+                               (point))))))))))
+
+
+
 
 (defun monad-post-self-insert ()
-  "Handle post-insertion actions: asm fontification and infix operator wrapping."
+  "Handle post-insertion actions: asm fontification."
   (when (and (monad-in-asm-form-p)
              (eq (char-before) ?:))
     (save-excursion
@@ -553,20 +889,50 @@ closing backtick ready to type the RHS."
             (line-end (line-end-position)))
         (font-lock-flush line-start line-end)
         (font-lock-fontify-region line-start line-end))))
-  ;; If we just typed a space inside a backtick pair `...|`),
-  ;; move the space to after the closing backtick instead.
-  (when (and (eq (char-before) ?\s)
-             (eq (char-after) ?`))
-    (delete-char -1)
-    (forward-char 1)
-    (insert ?\s))
-  (when (monad--infix-auto-wrap-p)
-    (monad--infix-do-wrap)))
+  (let ((in-module
+         (save-excursion
+           (catch 'found
+             (condition-case nil
+                 (while t
+                   (up-list -1)
+                   (when (and (eq (char-after) ?\()
+                              (save-excursion
+                                (forward-char 1)
+                                (skip-chars-forward " \t\n")
+                                (looking-at "module\\b")))
+                     (throw 'found t)))
+               (error nil))))))
+    (monad-insert-set-member)
+    (unless in-module
+      (monad-insert-type-annotation)
+      (monad-insert-arrow-annotation))))
 
 (defun monad-insert-lambda ()
-  "Insert λ, or .λ if preceded by λx pattern (λ two chars back)."
+  "Insert λ smartly, building λx.λy.λz... chains."
   (interactive)
-  (insert (if (eq (char-before (- (point) 1)) ?λ) ".λ" "λ")))
+  (cond
+   ;; After λX (letter right after λ, no dot yet) -> insert .λ
+   ((and (> (point) 1)
+         (let ((c (char-before)))
+           (and (>= c ?a) (<= c ?z)))
+         (eq (char-before (1- (point))) ?λ))
+    (insert ".λ"))
+   ;; After λX.λ -> increment letter and continue chain
+   ;; Structure: prev-letter . λ  <- point is here
+   ((and (> (point) 3)
+         (eq (char-before) ?λ)
+         (eq (char-before (1- (point))) ?.)
+         (let ((c (char-before (- (point) 2))))
+           (and (>= c ?a) (<= c ?z))))
+    (let* ((prev-letter (char-before (- (point) 2)))
+           (next-letter (if (< prev-letter ?z) (1+ prev-letter) ?a)))
+      (insert (char-to-string next-letter) ".λ")))
+   ;; After bare λ -> insert first param 'x'
+   ((eq (char-before) ?λ)
+    (insert "x"))
+   ;; Fallback: insert λ
+   (t
+    (insert "λ"))))
 
 (defun monad-colon ()
   "Insert a colon and auto-indent if in asm block."
@@ -612,8 +978,9 @@ closing backtick ready to type the RHS."
     "syscall" "int" "int3" "rdtsc"
     ;; String ops
     "rep" "repe" "repz" "repne" "repnz"
+    "cpuid"
     ;; ARM
-    "swi")
+    "swi" "mrs" "lsr" "cset" "csel")
   "Assembly instructions.")
 
 (defconst monad-asm-registers
@@ -649,17 +1016,66 @@ closing backtick ready to type the RHS."
                '("\\$0x[0-9a-fA-F]+"          . font-lock-constant-face)
                '("-?[0-9]+(%[a-z]+"           . font-lock-constant-face))))))
 
+
+(defun monad-block-comment-matcher (limit)
+  "Match -| ... |- block comments or -| paragraph comments up to LIMIT."
+  (when (re-search-forward "-|" limit t)
+    (let* ((open-start (match-beginning 0))
+           (after-open (match-end 0))
+           (close-pos  (save-excursion
+                         (goto-char after-open)
+                         (search-forward "|-" nil t)))
+           ;; The first newline after -| marks end of paragraph comment
+           (first-newline (save-excursion
+                            (goto-char open-start)
+                            (end-of-line)
+                            (point))))
+      (cond
+       ;; Block comment: found |- with no nested -| before it
+       ((and close-pos
+             (not (save-excursion
+                    (goto-char after-open)
+                    (search-forward "-|" close-pos t))))
+        (put-text-property open-start close-pos 'font-lock-multiline t)
+        (set-match-data (list open-start close-pos))
+        (goto-char close-pos))
+       ;; Paragraph comment: no valid |- — highlight until first empty line
+       (t
+        (let ((para-end (save-excursion
+                          (goto-char after-open)
+                          (catch 'done
+                            (while (not (eobp))
+                              (forward-line 1)
+                              (when (looking-at "^$")
+                                (throw 'done (point))))
+                            (point)))))
+          (put-text-property open-start para-end 'font-lock-multiline t)
+          (set-match-data (list open-start para-end)))))
+      t)))
+
 (defun monad-font-lock-keywords ()
-  "Return font-lock keywords for Monad mode."
+  "Return font-lock keywords for Wisp mode."
   (append
    (list
-
+    '(monad-block-comment-matcher (0 (progn
+                                       (put-text-property (match-beginning 0)
+                                                          (match-end 0)
+                                                          'font-lock-multiline t)
+                                       font-lock-comment-face)
+                                   t))
     '("\\<include\\s-+\\(<[^>\n]+>\\)"
       (1 font-lock-string-face t))
 
-    (list 'monad-infix-matcher
-          '(0 'monad-infix-face t)
-          '(1 'monad-infix-face t))
+    ;; Wisp-style (Haskell-like) defines — order matters: -> check before plain ::
+    '("^define\\s-+\\(\\(?:\\sw\\|\\s_\\)+\\)\\s-+::[^\n]*->"
+      (1 font-lock-function-name-face))
+    '("^define\\s-+\\(\\(?:\\sw\\|\\s_\\)+\\)\\s-+::[^\n]*"
+      (1 font-lock-variable-name-face))
+    '("^define\\s-+(\\(\\(?:\\sw\\|\\s_\\)+\\)"
+      (1 font-lock-function-name-face))
+    '("^define\\s-+\\(\\(?:\\sw\\|\\s_\\)+\\)\\s-+->"
+      (1 font-lock-function-name-face))
+
     '("(\\s-*\\(asm\\)\\_>" 1 font-lock-keyword-face)
     (cons (regexp-opt (remove "asm" monad-keywords) 'symbols)
           'font-lock-keyword-face)
@@ -1144,6 +1560,14 @@ Priority rules:
 (defun monad-mode-variables ()
   "Set up variables for Monad mode."
   (set-syntax-table monad-mode-syntax-table)
+  (cond
+   ((fboundp 'flycheck-mode)
+    (flycheck-mode 1)
+    (with-eval-after-load 'flycheck
+      (flycheck-select-checker 'monad)))
+   ((fboundp 'flymake-mode)
+    (monad--setup-flymake)
+    (flymake-mode 1)))
   (setq local-abbrev-table monad-mode-abbrev-table)
   (setq-local paragraph-start (concat "$\\|" page-delimiter))
   (setq-local paragraph-separate paragraph-start)
@@ -1190,11 +1614,10 @@ Priority rules:
           (font-lock-syntactic-face-function
            . monad-syntactic-face-function)))
   (setq-local lisp-doc-string-elt-property 'monad-doc-string-elt)
+  (local-set-key (kbd "M-;") #'monad-comment-dwim)
   (add-hook 'xref-backend-functions #'monad-xref-backend nil t)
   (add-hook 'completion-at-point-functions #'monad-completion-at-point nil t)
   (add-hook 'post-self-insert-hook #'monad-post-self-insert nil t)
-  (add-hook 'post-command-hook #'monad-infix-schedule-refresh nil t)
-  (monad--setup-electric-pair)
   (rainbow-delimiters-mode 1)
   (when (fboundp 'porg-mode)
     (porg-mode 1))
@@ -1582,6 +2005,93 @@ Each symbol is propertized with the correct `company-kind': `function' or
              mods
              (monad--import-completions imports)))))
 
+;;; Flycheck backend
+
+(defcustom monad-compiler-executable "monad"
+  "Path to the Monad compiler executable."
+  :type 'string
+  :group 'monad)
+
+(with-eval-after-load 'flycheck
+  (flycheck-define-checker monad
+    "A Monad syntax/type checker using the monad compiler."
+    :command ("monad" source "-o" "/dev/null")
+    :error-patterns
+    ((error   line-start (file-name) ":" line ":" column ": error: "   (message) line-end)
+     (warning line-start (file-name) ":" line ":" column ": warning: " (message) line-end)
+     (info    line-start (file-name) ":" line ":" column ": note: "    (message) line-end))
+    :modes monad-mode)
+  (add-to-list 'flycheck-checkers 'monad))
+
+;;; Flymake backend
+
+(defvar-local monad--flymake-proc nil)
+
+(defun monad-flymake-backend (report-fn &rest _args)
+  "Flymake backend for Monad.  REPORT-FN is called with diagnostics."
+  (unless (executable-find monad-compiler-executable)
+    (error "Cannot find monad compiler '%s'" monad-compiler-executable))
+
+  ;; Kill any running check process
+  (when (process-live-p monad--flymake-proc)
+    (kill-process monad--flymake-proc))
+
+  (let* ((source (current-buffer))
+         (tmpfile (make-temp-file "monad-flymake-" nil ".mon")))
+
+    ;; Write buffer contents to temp file
+    (write-region nil nil tmpfile nil 'silent)
+
+    (setq monad--flymake-proc
+          (make-process
+           :name "monad-flymake"
+           :noquery t
+           :connection-type 'pipe
+           :buffer (generate-new-buffer " *monad-flymake*")
+           :stderr (generate-new-buffer " *monad-flymake*")
+           :command (list monad-compiler-executable tmpfile)
+           :sentinel
+           (lambda (proc _event)
+             (when (memq (process-status proc) '(exit signal))
+               (unwind-protect
+                   (if (with-current-buffer source
+                         (eq proc monad--flymake-proc))
+                       (with-current-buffer (process-buffer proc)
+                         (goto-char (point-min))
+                         (let (diags)
+                           (while (re-search-forward
+                                   ;; Pattern: file:line:col: level: message
+                                   (rx bol
+                                       (? (group (+ (not ":"))) ":")  ; optional file
+                                       (group (+ digit)) ":"          ; line
+                                       (group (+ digit)) ": "         ; col
+                                       (group (or "error" "warning" "note")) ": "
+                                       (group (+ any)) eol)
+                                   nil t)
+                             (let* ((line    (string-to-number (match-string 2)))
+                                    (col     (string-to-number (match-string 3)))
+                                    (level   (match-string 4))
+                                    (msg     (match-string 5))
+                                    (type    (pcase level
+                                               ("error"   :error)
+                                               ("warning" :warning)
+                                               (_         :note)))
+                                    (region  (flymake-diag-region source line col)))
+                               (push (flymake-make-diagnostic
+                                      source
+                                      (car region) (cdr region)
+                                      type
+                                      msg)
+                                     diags)))
+                           (funcall report-fn (nreverse diags))))
+                     (flymake-log :warning "Obsolete monad-flymake process"))
+                 (ignore-errors (delete-file tmpfile))
+                 (kill-buffer (process-buffer proc)))))))))
+
+(defun monad--setup-flymake ()
+  "Register the Monad Flymake backend in the current buffer."
+  (add-hook 'flymake-diagnostic-functions #'monad-flymake-backend nil t))
+
 (defun monad--read-full-docstring-at-point ()
   "Return the full docstring text for the define form at point."
   (condition-case nil
@@ -1643,6 +2153,17 @@ Each symbol is propertized with the correct `company-kind': `function' or
         (user-error "No docstring for `%s'" name))
       (message "%s" (propertize doc 'face 'font-lock-doc-face)))))
 
+(defun monad-comment-dwim ()
+  "Insert -| comment, or close with |- if current line has an unclosed -|."
+  (interactive)
+  (let ((line (buffer-substring-no-properties (line-beginning-position) (point))))
+    (if (string-match-p "-|" line)
+        (if (and (> (point) (line-beginning-position))
+                 (not (eq (char-before) ?\s)))
+            (insert " |-")
+          (insert "|-"))
+      (insert "-| "))))
+
 (defun monad-compile-and-run ()
   "Compile and run current Monad file using compilation mode."
   (interactive)
@@ -1666,19 +2187,257 @@ Each symbol is propertized with the correct `company-kind': `function' or
   (interactive)
   (goto-char (point-min))
   (if (re-search-forward "^(tests\\_>" nil t)
-      (goto-char (match-beginning 0))
+      (progn
+        (goto-char (match-beginning 0))
+        (recenter-top-bottom 0))
     (user-error "No (tests form found in buffer")))
+
+(defun monad-goto-module ()
+  "Move cursor to the opening parenthesis of the (module form."
+  (interactive)
+  (goto-char (point-min))
+  (if (re-search-forward "^(module\\_>" nil t)
+      (goto-char (match-beginning 0))
+    (user-error "No (module form found in buffer")))
+
+;; Modal i guess
+(defun monad-insert-or (key action)
+  "Bind KEY to insert itself or run ACTION on region.
+Fully preserves undo behavior for self-insertion."
+  (if (string= key (char-to-string (string-to-char key))) ; single character keys only
+      (define-key (current-global-map) (kbd key)
+                  `(menu-item "" nil :filter
+                              (lambda (&optional _)
+                                (if (use-region-p)
+                                    (progn
+                                      (setq this-command ',action)
+                                      ',action)
+                                  (setq this-command 'self-insert-command)
+                                  (let ((last-command-event ,(string-to-char key)))
+                                    'self-insert-command)))))
+    (define-key (current-global-map) (kbd key)
+                `(lambda ()
+                   (interactive)
+                   (if (use-region-p)
+                       (call-interactively ',action)
+                     (insert ,key))))))
+
+(defun monad-newline ()
+  "Insert a newline smartly based on context.
+- Inside layout/module blocks: inserts [] and copies types.
+- Inside pattern match clauses: auto-inserts [] for list types.
+- Inside guards: auto-continues the | symbol.
+- Before guards: detects clause heads and auto-indents with |."
+  (interactive)
+  (let* ((at-eol (save-excursion (skip-chars-forward " \t)") (eolp)))
+         (ppss (syntax-ppss))
+         (paren-depth (car ppss))
+         ;; Renamed variable to reflect it handles multiple block types
+         (in-target-block (save-excursion
+                            (catch 'found
+                              (condition-case nil
+                                  (while t
+                                    (up-list -1)
+                                    (when (and (eq (char-after) ?\()
+                                               (save-excursion
+                                                 (forward-char 1)
+                                                 (skip-chars-forward " \t\n")
+                                                 (looking-at "\\(?:layout\\|module\\)\\_>")))
+                                      (throw 'found t)))
+                                (error nil))))))
+
+    ;; 1. If currently inside an empty target [] block, just jump inside it
+    (if (and in-target-block
+             (save-excursion
+               (beginning-of-line)
+               (looking-at "[ \t]*\\[[ \t]*\\][ \t)]*$")))
+        (progn
+          (beginning-of-line)
+          (search-forward "["))
+
+      ;; 2. Target block layout type inheritance
+      (when in-target-block
+        (save-excursion
+          (beginning-of-line)
+          (when (re-search-forward "\\[[ \t]*[^: \t]+[ \t]*::\\([ \t]*\\)\\][ \t)]*$" (line-end-position) t)
+            (let ((spaces-start (match-beginning 1))
+                  (spaces-end (match-end 1)))
+              (save-excursion
+                (forward-line -1)
+                (beginning-of-line)
+                (when (re-search-forward "::[ \t]*\\([^]\n]+?\\)[ \t]*\\]" (line-end-position) t)
+                  (let ((prev-type (match-string 1)))
+                    (goto-char spaces-start)
+                    (delete-region spaces-start spaces-end)
+                    (insert " " prev-type))))))))
+
+      ;; 3. Smart Newline Execution
+      (cond
+       ;; If not at EOL, fallback to standard newline to avoid messing up mid-line splits
+       ((not at-eol)
+        (newline-and-indent))
+
+       ;; Pattern matching / Guard logic (only trigger if we are at top-level depth)
+       ((and (<= paren-depth 1) (not in-target-block))
+        (let ((line-str (string-trim (buffer-substring-no-properties (line-beginning-position) (line-end-position))))
+              (indent (current-indentation)))
+          (cond
+           ;; Case A: Continuing a guard line (starts with |)
+           ((string-match-p "^|" line-str)
+            (newline)
+            (indent-to indent)
+            (insert "| "))
+
+           ;; Case B: End of a pattern clause (has ->, does not start with |)
+           ((string-match-p "->" line-str)
+            (newline-and-indent)
+            ;; Check if the first arg in the define signature is a List or [a]
+            (when (save-excursion
+                    (when (re-search-backward "^\\s-*\\(?:(define\\|define\\)\\_>" nil t)
+                      ;; Look up to 2 lines ahead to catch signatures split across a newline
+                      (re-search-forward "::\\s-*\\(\\[.*?\\]\\|List\\b\\)" (save-excursion (forward-line 2) (point)) t)))
+              (insert "[]")
+              (backward-char)))
+
+           ;; Case C: Start of guards (clause head without ->)
+           ((and (not (string-empty-p line-str))
+                 (not (string-match-p "->" line-str))
+                 (not (string-match-p "::" line-str)))
+            (let ((should-guard
+                   (save-excursion
+                     (forward-line -1)
+                     (while (and (not (bobp)) (looking-at "^\\s-*$"))
+                       (forward-line -1))
+                     ;; Trigger if peer line has -> OR parent define/match line has ->
+                     (or (and (= (current-indentation) indent)
+                              (string-match-p "->" (thing-at-point 'line t)))
+                         (and (< (current-indentation) indent)
+                              (looking-at "^\\s-*\\(?:(define\\|define\\|case\\|match\\)\\_>")
+                              (string-match-p "->" (thing-at-point 'line t)))))))
+              (if should-guard
+                  (progn
+                    (newline)
+                    (indent-to (+ indent 2))
+                    (insert "| "))
+                (newline-and-indent))))
+
+           ;; Default: normal newline
+           (t (newline-and-indent)))))
+
+       ;; 4. Fallback for Target blocks (insert [])
+       (t
+        (newline-and-indent)
+        (when (and at-eol in-target-block)
+          (insert "[]")
+          (backward-char)))))))
+
+
+(defvar-keymap monad-unicode-map
+  :doc "Keymap for inserting Unicode symbols in Monad mode."
+  "o" (lambda () (interactive) (insert "∘"))
+  "e" (lambda () (interactive) (insert "∈"))
+  "E" (lambda () (interactive) (insert "∃"))
+  "A" (lambda () (interactive) (insert "∀"))
+  "p" (lambda () (interactive) (insert "π"))
+  "P" (lambda () (interactive) (insert "Π"))
+  "t" (lambda () (interactive) (insert "θ"))
+  "T" (lambda () (interactive) (insert "Θ"))
+  "u" (lambda () (interactive) (insert "∪"))
+  "n" (lambda () (interactive) (insert "∩"))
+  "l" (lambda () (interactive) (insert "λ"))
+  "L" (lambda () (interactive) (insert "Λ"))
+  "S" (lambda () (interactive) (insert "Σ"))
+  "s" (lambda () (interactive) (insert "σ"))
+  "d" (lambda () (interactive) (insert "Δ"))
+  "a" (lambda () (interactive) (insert "α"))
+  "b" (lambda () (interactive) (insert "β"))
+  "g" (lambda () (interactive) (insert "γ"))
+  "G" (lambda () (interactive) (insert "Γ"))
+  "m" (lambda () (interactive) (insert "μ"))
+  "x" (lambda () (interactive) (insert "×"))
+  "*" (lambda () (interactive) (insert "×"))
+  "-" (lambda () (interactive) (insert "→"))
+  "=" (lambda () (interactive) (insert "⇒"))
+  "<" (lambda () (interactive) (insert "⟨"))
+  ">" (lambda () (interactive) (insert "⟩")))
+
+;;; Matrix literal support
+
+(defvar-local monad--matrix-start nil
+  "Marker at the beginning of the first matrix content line.")
+
+(defvar-local monad--matrix-bottom nil
+  "Marker at the beginning of the ─╯ line.")
+
+(defun monad--matrix-update-bottom ()
+  "Rewrite the ─╯ line to align with the widest content line."
+  (when (and monad--matrix-start
+             monad--matrix-bottom
+             (marker-buffer monad--matrix-start)
+             (marker-buffer monad--matrix-bottom))
+    (save-excursion
+      (let ((max-len 0)
+            (pos (marker-position monad--matrix-start))
+            (bottom (marker-position monad--matrix-bottom)))
+        ;; Scan every content line between start and bottom markers
+        (goto-char pos)
+        (while (< (point) bottom)
+          (let ((len (- (line-end-position) (line-beginning-position))))
+            (when (> len max-len)
+              (setq max-len len)))
+          (forward-line 1))
+        ;; Rewrite the bottom line
+        (goto-char bottom)
+        (delete-region (line-beginning-position) (line-end-position))
+        (insert (make-string max-len ? ) "─╯")))))
+
+(defun monad--matrix-post-command ()
+  "Hook: update matrix bottom delimiter after any command."
+  (when (and monad--matrix-start
+             monad--matrix-bottom
+             (marker-buffer monad--matrix-start)
+             (marker-buffer monad--matrix-bottom))
+    (let ((pos (point))
+          (bottom (marker-position monad--matrix-bottom)))
+      (if (< pos bottom)
+          (monad--matrix-update-bottom)
+        (set-marker monad--matrix-start nil)
+        (set-marker monad--matrix-bottom nil)
+        (remove-hook 'post-command-hook #'monad--matrix-post-command t)))))
+
+(defun monad-insert-matrix ()
+  "Insert a matrix literal and track the bottom delimiter automatically."
+  (interactive)
+  (when (markerp monad--matrix-start)  (set-marker monad--matrix-start nil))
+  (when (markerp monad--matrix-bottom) (set-marker monad--matrix-bottom nil))
+  (remove-hook 'post-command-hook #'monad--matrix-post-command t)
+  (insert "╭─\n  \n   ─╯")
+  (forward-line -1)
+  (end-of-line)
+  (setq monad--matrix-start (copy-marker (line-beginning-position) nil))
+  (save-excursion
+    (forward-line 1)
+    (setq monad--matrix-bottom (copy-marker (line-beginning-position) nil)))
+  (run-with-timer 0 nil
+                  (lambda ()
+                    (add-hook 'post-command-hook #'monad--matrix-post-command nil t))))
 
 (defvar-keymap monad-mode-map
   :doc "Keymap for Monad mode."
   :parent lisp-mode-shared-map
+  "RET" #'monad-newline
   ":" #'monad-colon
+  "e" (monad-insert-or "e" 'monad-repl-eval-region)
   "\\" #'monad-insert-lambda
   "C-c C-d" #'monad-show-docstring
+  "C-c m" #'monad-insert-matrix
   "C-c C-c" #'monad-compile-and-run
   "C-c t" #'monad-compile-and-run-tests
   "M-g t" #'monad-goto-tests
-  "M-," #'monad-xref-go-back)
+  "M-g m" #'monad-goto-module
+  "M-," #'monad-xref-go-back
+  "M-;" #'monad-comment-dwim
+  "C-x /" monad-unicode-map)
 
 ;;;###autoload
 (define-derived-mode monad-mode prog-mode "Monad"

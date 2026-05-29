@@ -20,8 +20,10 @@
 ;; - Region evaluation
 ;; - ANSI color support
 
-;;; TODO [0/1]
+;;; TODO [0/3]
+;; - [ ] When clicking on a warning pulse with the a warning face instead!
 ;; - [ ] Apropos to search for functions/variables/modules
+;; - [ ] It doesn't buttonize errors when loading with ,load E.g: Random.mon:122:23: error: unbound variable: e18
 
 ;;; Code:
 
@@ -513,15 +515,6 @@ Returns (START . END) or nil."
                 :exclusive 'yes
                 :company-kind (lambda (_) 'c-header))))))))
 
-(defun monad-repl--post-self-insert ()
-  "Trigger completion after typing space following (import or bare import."
-  (when (and (derived-mode-p 'monad-repl-mode)
-             (eq last-command-event ?\s)
-             (or (looking-back "(import +" (line-beginning-position))
-                 (looking-back "\\bimport +" (line-beginning-position))
-                 (looking-back "\\binclude +" (line-beginning-position))))
-    (completion-at-point)))
-
 ;;; Eldoc
 
 (defun monad-repl--depth-face (depth)
@@ -912,43 +905,49 @@ Priority rules:
 
 (defun monad-repl--buttonize-errors (output)
   "Buttonize <input>:LINE:COL: error: lines in OUTPUT like `compilation-mode'."
-  (let ((result output))
-    (when (and (string-search "<input>:" output)
-               (string-match "<input>:\\([0-9]+\\):\\([0-9]+\\):\\([^\n]*\\)" output))
-      (let* ((line       (string-to-number (match-string 1 output)))
-             (col        (string-to-number (match-string 2 output)))
-             (rest       (match-string 3 output))
+  (let ((result output)
+        (start 0))
+    ;; Process all matches in the string
+    (while (and (or (string-search "<input>:" result start)
+                   (string-search ".mon:" result start))
+               (string-match "\\(<input>\\|[^:\n]+\\.mon\\):\\([0-9]+\\):\\([0-9]+\\):\\([^\n]*\\)" result start))
+      (let* ((location   (match-string 1 result))
+             (line       (string-to-number (match-string 2 result)))
+             (col        (string-to-number (match-string 3 result)))
+             (rest       (match-string 4 result))
              (full-start (match-beginning 0))
              (full-end   (match-end 0))
              (keymap     (let ((map (make-sparse-keymap)))
                            (define-key map [mouse-1] #'monad-repl--jump-to-error)
                            (define-key map (kbd "RET") #'monad-repl--jump-to-error)
                            map))
-         (props      `(monad-repl-error-line ,line
+             (props      `(monad-repl-error-location ,location
+                           monad-repl-error-line ,line
                            monad-repl-error-col  ,col
                            mouse-face            highlight
                            help-echo             "mouse-1: go to error position"
                            keymap                ,keymap))
-         (error-type (if (string-match "warning" (match-string 3 output))
-                        'compilation-warning
-                      'compilation-error)))
-        (setq result
-              (concat
-               (substring output 0 full-start)
-               (apply #'propertize "<input>"
-                      'face (list error-type :underline t) props)
-               (apply #'propertize ":"
-                      'face '(:underline t) props)
-               (apply #'propertize (number-to-string line)
-                      'face '(compilation-line-number :underline t) props)
-               (apply #'propertize ":"
-                      'face '(:underline t) props)
-               (apply #'propertize (number-to-string col)
-                      'face '(compilation-column-number :underline t) props)
-               (apply #'propertize ":" 'face 'default props)
-               (apply #'propertize rest 'face 'default props)
-               ;; Preserve everything after the matched region
-               (substring output full-end)))))
+             (error-type (if (string-match "warning" rest)
+                            'compilation-warning
+                          'compilation-error))
+             (before (substring result 0 full-start))
+             (after (substring result full-end))
+             (buttonized (concat
+                         (apply #'propertize location
+                                'face (list error-type :underline t) props)
+                         (apply #'propertize ":"
+                                'face '(:underline t) props)
+                         (apply #'propertize (number-to-string line)
+                                'face '(compilation-line-number :underline t) props)
+                         (apply #'propertize ":"
+                                'face '(:underline t) props)
+                         (apply #'propertize (number-to-string col)
+                                'face '(compilation-column-number :underline t) props)
+                         (apply #'propertize ":" 'face 'default props)
+                         (apply #'propertize rest 'face 'default props))))
+        ;; Reconstruct result with this match buttonized, and continue searching after it
+        (setq result (concat before buttonized after)
+              start (+ (length before) (length buttonized)))))
     result))
 
 (defun monad-repl--lerp-color (from to step steps)
@@ -993,17 +992,28 @@ Like `pulse' but interpolates both foreground and background."
 (defun monad-repl--jump-to-error ()
   "Jump to the error position referenced by the button at point."
   (interactive)
-  (let ((line (get-text-property (point) 'monad-repl-error-line))
+  (let ((location (get-text-property (point) 'monad-repl-error-location))
+        (line (get-text-property (point) 'monad-repl-error-line))
         (col  (get-text-property (point) 'monad-repl-error-col)))
-    (when (and line col)
-      (comint-previous-prompt 1)
-      (forward-line (1- line))
-      (beginning-of-line)
-      (forward-char (1- col))
+    (when (and location line col)
+      (if (string= location "<input>")
+          ;; Jump to REPL input
+          (progn
+            (comint-previous-prompt 1)
+            (forward-line (1- line))
+            (beginning-of-line)
+            (forward-char (1- col)))
+        ;; Jump to file
+        (find-file-other-window location)
+        (goto-char (point-min))
+        (forward-line (1- line))
+        (beginning-of-line)
+        (forward-char (1- col)))
+
       ;; Skip past comment lines and blank lines to find real code
       (while (and (not (eobp))
-                  (or (looking-at "^\\s-*$")          ; blank line
-                      (looking-at "^\\s-*;")))        ; comment line
+                  (or (looking-at "^\\s-*$")
+                      (looking-at "^\\s-*;")))
         (forward-line 1)
         (beginning-of-line))
       (skip-chars-forward "^A-Za-z0-9_'!?$%&*/+<=>.^~-")
@@ -1269,6 +1279,23 @@ BEG and END are the region boundaries."
       ;; Not yet indented — indent
       (monad-repl--indent-line))))
 
+(defun monad-repl--space-or-skip ()
+  "Insert space, or skip past closing backtick if point is before one."
+  (interactive)
+  (if (eq (char-after) ?`)
+      (progn (forward-char 1) (insert ?\s))
+    (insert ?\s)))
+
+(defun monad-repl--post-self-insert ()
+  "Handle post-insertion actions in the REPL for import completion."
+
+  ;; Trigger completion after import/include
+  (when (and (eq last-command-event ?\s)
+             (or (looking-back "(import +" (line-beginning-position))
+                 (looking-back "\\bimport +" (line-beginning-position))
+                 (looking-back "\\binclude +" (line-beginning-position))))
+    (completion-at-point)))
+
 (define-derived-mode monad-repl-mode comint-mode "Monad-REPL"
   "Major mode for interacting with a Monad REPL.
 
@@ -1314,6 +1341,7 @@ BEG and END are the region boundaries."
             #'monad-repl-completion-at-point nil t)
 
   (add-hook 'post-self-insert-hook #'monad-repl--post-self-insert nil t)
+  (monad--setup-electric-pair)
 
   ;; Clear cache on user input
   (add-hook 'comint-input-filter-functions
