@@ -174,7 +174,7 @@
     "and" "or" "not" "quote" "unquote" "quasiquote"
     "begin" "when" "unless" "error" "instance" "asm"
     "module" "import" "qualified" "hiding" "tests" "test"
-    "take" "drop" "include" "for" "while" "mod" "class"
+    "take" "drop" "include" "for" "in" "while" "mod" "class"
     "where" "show" "set!" "set" "otherwise")
   "Keywords for the Monad programming language.")
 
@@ -191,6 +191,28 @@ group 1.  Supported forms include `(define (name ...)',
           "\\(" (or (and name (regexp-quote name))
                     monad--identifier-regexp)
           "\\)\\_>"))
+
+(defun monad--type-name-regexp (&optional name)
+  "Return a regexp matching a refinement type definition for NAME.
+When NAME is nil, the returned regexp captures the type name in group 1."
+  (concat "^\\(?:([ \t]*\\)?type\\s-+"
+          "\\(" (or (and name (regexp-quote name))
+                    monad--identifier-regexp)
+          "\\)\\_>"))
+
+(defun monad--layout-name-regexp (&optional name)
+  "Return a regexp matching a layout definition for NAME.
+When NAME is nil, the returned regexp captures the layout name in group 1."
+  (concat "^\\(?:([ \t]*\\)?layout\\s-+"
+          "\\(" (or (and name (regexp-quote name))
+                    monad--identifier-regexp)
+          "\\)\\_>"))
+
+(defun monad--definition-name-regexps (&optional name)
+  "Return regexps matching top-level definition forms for NAME."
+  (list (monad--define-name-regexp name)
+        (monad--type-name-regexp name)
+        (monad--layout-name-regexp name)))
 
 (defun monad--haskell-define-signature (name)
   "Return the Haskell-style signature line for define NAME, or nil."
@@ -300,21 +322,24 @@ Returns the first line of the docstring, or nil."
   (unless monad--docstring-cache
     (setq monad--docstring-cache (monad--cache-docstrings)))
   (let (index (max-name 0) (max-type 0))
-    (save-excursion
-      (goto-char (point-min))
-      (while (re-search-forward (monad--define-name-regexp) nil t)
-        (let* ((name (match-string-no-properties 1))
-               (display-name (if (monad--haskell-define-at-point-p)
-                                 (propertize name 'face 'font-lock-function-name-face)
-                               name))
-               (type (monad--imenu-type-annotation name))
-               (tlen (if type (length type) 0)))
-          (when (> (length name) max-name) (setq max-name (length name)))
-          (when (> tlen max-type)          (setq max-type tlen))
-          (push (cons display-name (copy-marker (match-beginning 1))) index))))
+    (dolist (rx (monad--definition-name-regexps))
+      (save-excursion
+        (goto-char (point-min))
+        (while (re-search-forward rx nil t)
+          (let* ((name (match-string-no-properties 1))
+                 (display-name (if (monad--haskell-define-at-point-p)
+                                   (propertize name 'face 'font-lock-function-name-face)
+                                 name))
+                 (type (monad--imenu-type-annotation name))
+                 (tlen (if type (length type) 0)))
+            (when (> (length name) max-name) (setq max-name (length name)))
+            (when (> tlen max-type)          (setq max-type tlen))
+            (push (cons display-name (copy-marker (match-beginning 1))) index)))))
     (setq monad--imenu-max-name-len max-name
           monad--imenu-max-type-len max-type)
-    (nreverse index)))
+    (sort index (lambda (a b)
+                  (< (marker-position (cdr a))
+                     (marker-position (cdr b)))))))
 
 (defun monad--imenu-type-annotation (name)
   "Return a raw (unpropertized) type/signature string for NAME, or nil."
@@ -2059,13 +2084,18 @@ Each symbol is propertized with the correct `company-kind': `function' or
   "Return a list of all xref locations where SYMBOL is defined in BUF."
   (let (locs)
     (with-current-buffer buf
-      (save-excursion
-        (goto-char (point-min))
-        (while (re-search-forward (monad--define-name-regexp symbol) nil t)
-          (push (xref-make symbol
-                           (xref-make-buffer-location buf (match-beginning 1)))
-                locs))))
-    (nreverse locs)))
+      (dolist (rx (monad--definition-name-regexps symbol))
+        (save-excursion
+          (goto-char (point-min))
+          (while (re-search-forward rx nil t)
+            (push (xref-make symbol
+                             (xref-make-buffer-location buf (match-beginning 1)))
+                  locs)))))
+    (sort locs (lambda (a b)
+                 (< (marker-position
+                     (xref-location-marker (xref-item-location a)))
+                    (marker-position
+                     (xref-location-marker (xref-item-location b))))))))
 
 (defun monad--find-define-pos (buf symbol)
   "Return the first xref location for SYMBOL's definition in BUF, or nil."
