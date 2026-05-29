@@ -178,6 +178,37 @@
     "where" "show" "set!" "set" "otherwise")
   "Keywords for the Monad programming language.")
 
+(defconst monad--identifier-regexp "\\(?:\\sw\\|\\s_\\)+"
+  "Regexp matching a Monad identifier using `monad-mode-syntax-table'.")
+
+(defun monad--define-name-regexp (&optional name)
+  "Return a regexp matching a Lisp or Haskell-style define for NAME.
+When NAME is nil, the returned regexp captures the definition name in
+group 1.  Supported forms include `(define (name ...)',
+`(define [name :: Type] ...)', `(define name ...)', and
+`define name :: Type'."
+  (concat "^\\(?:([ \t]*\\)?define\\s-+\\(?:([ \t\n]*\\|\\[?\\)"
+          "\\(" (or (and name (regexp-quote name))
+                    monad--identifier-regexp)
+          "\\)\\_>"))
+
+(defun monad--haskell-define-signature (name)
+  "Return the Haskell-style signature line for define NAME, or nil."
+  (save-excursion
+    (goto-char (point-min))
+    (let ((rx (concat "^define\\s-+\\("
+                      (regexp-quote name)
+                      "\\)\\_>\\s-+::\\s-*\\(.+\\)$")))
+      (when (re-search-forward rx nil t)
+        (concat ":: " (string-trim (match-string-no-properties 2)))))))
+
+(defun monad--haskell-define-at-point-p ()
+  "Return non-nil when point is at a Haskell-style `define name ::' form."
+  (save-excursion
+    (goto-char (line-beginning-position))
+    (looking-at
+     (concat "^define\\s-+" monad--identifier-regexp "\\_>\\s-+::"))))
+
 ;;; Imenu — flat index with cached docstring annotations
 
 (defvar-local monad--docstring-cache nil
@@ -246,9 +277,7 @@ Returns the first line of the docstring, or nil."
   (let ((cache (make-hash-table :test #'equal)))
     (save-excursion
       (goto-char (point-min))
-      (while (re-search-forward
-              "^(define[ \t\n]+\\(?:(\\|\\[?\\)\\(\\(?:\\sw\\|\\s_\\)+\\)"
-              nil t)
+      (while (re-search-forward (monad--define-name-regexp) nil t)
         (let* ((name (match-string-no-properties 1))
                (def-start (match-beginning 0))
                (doc  (save-excursion
@@ -273,47 +302,51 @@ Returns the first line of the docstring, or nil."
   (let (index (max-name 0) (max-type 0))
     (save-excursion
       (goto-char (point-min))
-      (while (re-search-forward
-              "^(define[ \t\n]+\\(?:(\\|\\[?\\)\\(\\(?:\\sw\\|\\s_\\)+\\)"
-              nil t)
+      (while (re-search-forward (monad--define-name-regexp) nil t)
         (let* ((name (match-string-no-properties 1))
+               (display-name (if (monad--haskell-define-at-point-p)
+                                 (propertize name 'face 'font-lock-function-name-face)
+                               name))
                (type (monad--imenu-type-annotation name))
                (tlen (if type (length type) 0)))
           (when (> (length name) max-name) (setq max-name (length name)))
           (when (> tlen max-type)          (setq max-type tlen))
-          (push (cons name (copy-marker (match-beginning 1))) index))))
+          (push (cons display-name (copy-marker (match-beginning 1))) index))))
     (setq monad--imenu-max-name-len max-name
           monad--imenu-max-type-len max-type)
     (nreverse index)))
 
 (defun monad--imenu-type-annotation (name)
   "Return a raw (unpropertized) type/signature string for NAME, or nil."
-  (save-excursion
-    (goto-char (point-min))
-    (let ((fn-rx (concat "^(define[ \t\n]+(\\("
-                         (regexp-quote name) "\\)\\b")))
-      (if (re-search-forward fn-rx nil t)
-          (condition-case nil
-              (progn
-                (goto-char (match-beginning 0))
-                (down-list 1)
-                (forward-sexp 1)
-                (skip-chars-forward " \t\n")
-                (let ((hdr-start (point)))
-                  (forward-sexp 1)
-                  (buffer-substring-no-properties hdr-start (point))))
-            (error nil))
-        (goto-char (point-min))
-        (let ((tv-rx (concat "^(define[ \t\n]+\\(\\["
-                             (regexp-quote name)
-                             "[ \t]*::[^]\n]+\\]\\)")))
-          (when (re-search-forward tv-rx nil t)
-            (match-string-no-properties 1)))))))
+  (or
+   (monad--haskell-define-signature name)
+   (save-excursion
+     (goto-char (point-min))
+     (let ((fn-rx (concat "^(define[ \t\n]+(\\("
+                          (regexp-quote name) "\\)\\b")))
+       (if (re-search-forward fn-rx nil t)
+           (condition-case nil
+               (progn
+                 (goto-char (match-beginning 0))
+                 (down-list 1)
+                 (forward-sexp 1)
+                 (skip-chars-forward " \t\n")
+                 (let ((hdr-start (point)))
+                   (forward-sexp 1)
+                   (buffer-substring-no-properties hdr-start (point))))
+             (error nil))
+         (goto-char (point-min))
+         (let ((tv-rx (concat "^(define[ \t\n]+\\(\\["
+                              (regexp-quote name)
+                              "[ \t]*::[^]\n]+\\]\\)")))
+           (when (re-search-forward tv-rx nil t)
+             (match-string-no-properties 1))))))))
 
 (defun monad-imenu-annotate (cand)
   "Return an imenu annotation string for candidate CAND."
-  (let* ((type-raw  (monad--imenu-type-annotation cand))
-         (doc       (monad--get-cached-docstring cand))
+  (let* ((name      (substring-no-properties cand))
+         (type-raw  (monad--imenu-type-annotation name))
+         (doc       (monad--get-cached-docstring name))
          (col-a     (+ monad--imenu-max-name-len 2))
          (col-b     (+ col-a monad--imenu-max-type-len 2)))
     (when (or type-raw doc)
@@ -1133,19 +1166,26 @@ and aligns '-> ' to match previous lines. Handles type signatures and guards aut
       t)))
 
 (defun monad-refinement-type-docstring-matcher (limit)
-  "Match docstrings in refinement types up to LIMIT."
+  "Match indented docstrings following refinement type bodies up to LIMIT."
   (let (found)
     (while (and (not found)
-                (re-search-forward "\\<type\\>\\s-+\\(?:\\sw\\|\\s_\\)+\\s-+" limit t))
+                (re-search-forward
+                 (concat "^[ \t]*(?type[ \t]+"
+                         monad--identifier-regexp "\\_>")
+                 limit t))
       (unless (nth 8 (syntax-ppss))
         (save-excursion
-          (forward-comment limit)
-          (when (and (< (point) limit) (eq (char-after) ?\{))
+          (goto-char (match-end 0))
+          (skip-chars-forward " \t\n")
+          (when (and (< (point) limit)
+                     (eq (char-after) ?\{))
             (condition-case nil
                 (progn
                   (forward-sexp 1)
-                  (forward-comment limit)
-                  (when (and (< (point) limit) (eq (char-after) ?\"))
+                  (skip-chars-forward " \t\n")
+                  (when (and (< (point) limit)
+                             (eq (char-after) ?\")
+                             (> (current-indentation) 0))
                     (let ((s (point)))
                       (forward-sexp 1)
                       (when (<= (point) limit)
@@ -1172,7 +1212,7 @@ and aligns '-> ' to match previous lines. Handles type signatures and guards aut
     '("^define\\s-+\\(\\(?:\\sw\\|\\s_\\)+\\)\\s-+::[^\n]*->"
       (1 font-lock-function-name-face))
     '("^define\\s-+\\(\\(?:\\sw\\|\\s_\\)+\\)\\s-+::[^\n]*"
-      (1 font-lock-variable-name-face))
+      (1 font-lock-function-name-face))
     '("^define\\s-+(\\(\\(?:\\sw\\|\\s_\\)+\\)"
       (1 font-lock-function-name-face))
     '("^define\\s-+\\(\\(?:\\sw\\|\\s_\\)+\\)\\s-+->"
@@ -1492,22 +1532,24 @@ Only returns a name when we are inside the argument list of a call."
 
 (defun monad--extract-function-header (name)
   "Return the header sexp string for function NAME, or nil."
-  (save-excursion
-    (goto-char (point-min))
-    (let ((rx (concat "^(define[ \t\n]+(\\("
-                      (regexp-quote name)
-                      "\\)\\b")))
-      (when (re-search-forward rx nil t)
-        (goto-char (match-beginning 0))
-        (condition-case nil
-            (progn
-              (down-list 1)
-              (forward-sexp 1)
-              (skip-chars-forward " \t\n")
-              (let ((hdr-start (point)))
-                (forward-sexp 1)
-                (buffer-substring-no-properties hdr-start (point))))
-          (error nil))))))
+  (or
+   (monad--haskell-define-signature name)
+   (save-excursion
+     (goto-char (point-min))
+     (let ((rx (concat "^(define[ \t\n]+(\\("
+                       (regexp-quote name)
+                       "\\)\\b")))
+       (when (re-search-forward rx nil t)
+         (goto-char (match-beginning 0))
+         (condition-case nil
+             (progn
+               (down-list 1)
+               (forward-sexp 1)
+               (skip-chars-forward " \t\n")
+               (let ((hdr-start (point)))
+                 (forward-sexp 1)
+                 (buffer-substring-no-properties hdr-start (point))))
+           (error nil)))))))
 
 (defun monad--extract-variable-info (name)
   "Return eldoc string for a variable NAME, or nil."
@@ -1826,13 +1868,18 @@ Each symbol is propertized with the correct `company-kind': `function' or
   (let (names)
     (save-excursion
       (goto-char (point-min))
-      (while (re-search-forward
-              "^(define\\s-+\\(?:(\\(\\(?:\\sw\\|\\s_\\)+\\)\\|\\[?\\(\\(?:\\sw\\|\\s_\\)+\\)\\)"
-              nil t)
-        (let* ((fn-name  (match-string-no-properties 1))
-               (var-name (match-string-no-properties 2))
-               (name     (or fn-name var-name))
-               (kind     (if fn-name 'function 'variable)))
+      (while (re-search-forward (monad--define-name-regexp) nil t)
+        (let* ((name-start (match-beginning 1))
+               (name      (match-string-no-properties 1))
+               (kind      (if (or (eq (char-before name-start) ?\()
+                                   (save-excursion
+                                     (goto-char (match-beginning 0))
+                                     (looking-at
+                                      (concat "^define\\s-+"
+                                              (regexp-quote name)
+                                              "\\_>\\s-+::"))))
+                              'function
+                            'variable)))
           (when name
             (push (propertize name 'company-kind kind) names)))))
     (nreverse names)))
@@ -2014,17 +2061,10 @@ Each symbol is propertized with the correct `company-kind': `function' or
     (with-current-buffer buf
       (save-excursion
         (goto-char (point-min))
-        (while (re-search-forward
-                (concat "^(define\\s-+\\(?:"
-                        "(\\(" (regexp-quote symbol) "\\)\\_>"
-                        "\\|\\[\\(" (regexp-quote symbol) "\\)\\s-+::"
-                        "\\|\\(" (regexp-quote symbol) "\\)\\_>\\)")
-                nil t)
-          (let ((pos (or (match-beginning 1)
-                         (match-beginning 2)
-                         (match-beginning 3))))
-            (push (xref-make symbol (xref-make-buffer-location buf pos))
-                  locs)))))
+        (while (re-search-forward (monad--define-name-regexp symbol) nil t)
+          (push (xref-make symbol
+                           (xref-make-buffer-location buf (match-beginning 1)))
+                locs))))
     (nreverse locs)))
 
 (defun monad--find-define-pos (buf symbol)
