@@ -618,6 +618,85 @@ leaving any `invisible' properties set by other modes (e.g. `porg-mode') intact.
    (t
     (lisp-indent-line))))
 
+(defun monad--paragraph-comment-start (&optional pos)
+  "Return the start of the paragraph comment containing POS, or nil.
+A paragraph comment starts with `-|' and runs until the first truly
+empty line.  If a matching `|-' appears before that line, treat it as a
+block comment instead."
+  (save-excursion
+    (goto-char (or pos (point)))
+    (let ((origin (point)))
+      (beginning-of-line)
+      (catch 'found
+        (while t
+          (let ((bol (line-beginning-position))
+                (eol (line-end-position)))
+            (cond
+             ((looking-at "^[ \t]*-|")
+              (let* ((open-start (match-beginning 0))
+                     (after-open (match-end 0))
+                     (para-end
+                      (save-excursion
+                        (goto-char after-open)
+                        (catch 'end
+                          (while (not (eobp))
+                            (forward-line 1)
+                            (when (= (line-beginning-position)
+                                     (line-end-position))
+                              (throw 'end (point))))
+                          (point-max))))
+                     (close-pos
+                      (save-excursion
+                        (goto-char after-open)
+                        (search-forward "|-" para-end t))))
+                (throw 'found
+                       (and (<= origin para-end)
+                            (not close-pos)
+                            open-start))))
+             ((= bol eol)
+              (throw 'found nil))
+             ((looking-at "^[ \t]")
+              (if (bobp)
+                  (throw 'found nil)
+                (forward-line -1)))
+             (t
+              (throw 'found nil)))))))))
+
+(defun monad--paragraph-comment-backward-delete ()
+  "Delete backward by content inside a paragraph comment.
+Whitespace between point and the previous non-whitespace character is
+removed together with that character, making backspace behave like
+paragraph text editing."
+  (let ((comment-start (monad--paragraph-comment-start)))
+    (when comment-start
+      (let* ((origin (point))
+             (content-start (save-excursion
+                              (goto-char comment-start)
+                              (search-forward "-|" nil t)
+                              (point)))
+             (delete-start
+              (save-excursion
+                (skip-chars-backward " \t\n" content-start)
+                (when (> (point) content-start)
+                  (1- (point))))))
+        (when delete-start
+          (delete-region delete-start origin)
+          t)))))
+
+(defun monad-backward-delete-char-untabify (arg)
+  "Delete backward, with paragraph-comment content deletion.
+With point in a `-|' paragraph comment, backspace ignores indentation
+and blank continuation space, then deletes the previous real character.
+Everywhere else, behave like `backward-delete-char-untabify'."
+  (interactive "p")
+  (cond
+   ((use-region-p)
+    (delete-region (region-beginning) (region-end)))
+   ((and (= arg 1)
+         (monad--paragraph-comment-backward-delete)))
+   (t
+    (backward-delete-char-untabify arg))))
+
 (defun monad-insert-set-member ()
   "Replace space with ∈ when inside a set comprehension and preceded by space."
   (when (and (eq (char-before) ?\s)
@@ -2464,6 +2543,8 @@ Fully preserves undo behavior for self-insertion."
   :doc "Keymap for Monad mode."
   :parent lisp-mode-shared-map
   "RET" #'monad-newline
+  "DEL" #'monad-backward-delete-char-untabify
+  "<backspace>" #'monad-backward-delete-char-untabify
   ":" #'monad-colon
   "e" (monad-insert-or "e" 'monad-repl-eval-region)
   "\\" #'monad-insert-lambda
