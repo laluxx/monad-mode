@@ -1053,6 +1053,28 @@ and aligns '-> ' to match previous lines. Handles type signatures and guards aut
           (set-match-data (list open-start para-end)))))
       t)))
 
+(defun monad-refinement-type-docstring-matcher (limit)
+  "Match docstrings in refinement types up to LIMIT."
+  (let (found)
+    (while (and (not found)
+                (re-search-forward "\\<type\\>\\s-+\\(?:\\sw\\|\\s_\\)+\\s-+" limit t))
+      (unless (nth 8 (syntax-ppss))
+        (save-excursion
+          (forward-comment limit)
+          (when (and (< (point) limit) (eq (char-after) ?\{))
+            (condition-case nil
+                (progn
+                  (forward-sexp 1)
+                  (forward-comment limit)
+                  (when (and (< (point) limit) (eq (char-after) ?\"))
+                    (let ((s (point)))
+                      (forward-sexp 1)
+                      (when (<= (point) limit)
+                        (set-match-data (list s (point) s (point)))
+                        (setq found t)))))
+              (error nil))))))
+    found))
+
 (defun monad-font-lock-keywords ()
   "Return font-lock keywords for Wisp mode."
   (append
@@ -1063,6 +1085,7 @@ and aligns '-> ' to match previous lines. Handles type signatures and guards aut
                                                           'font-lock-multiline t)
                                        font-lock-comment-face)
                                    t))
+    '(monad-refinement-type-docstring-matcher (0 font-lock-doc-face t))
     '("\\<include\\s-+\\(<[^>\n]+>\\)"
       (1 font-lock-string-face t))
 
@@ -1144,6 +1167,21 @@ and aligns '-> ' to match previous lines. Handles type signatures and guards aut
                    3
                  0))
            (error 0))))))
+
+(put 'type 'monad-doc-string-elt
+     (lambda ()
+       (forward-comment (point-max))
+       (condition-case nil
+           (progn
+             (forward-sexp 1) ; skip name
+             (forward-comment (point-max))
+             (if (eq (char-after) ?\{)
+                 (progn
+                   (forward-sexp 1) ; skip { ... }
+                   (forward-comment (point-max))
+                   (if (eq (char-after) ?\") 3 0))
+               (if (eq (char-after) ?\") 2 0)))
+         (error 0))))
 
 ;;; Eldoc integration
 ;;
