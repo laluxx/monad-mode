@@ -466,10 +466,10 @@ leaving any `invisible' properties set by other modes (e.g. `porg-mode') intact.
 (defun monad--setup-electric-pair ()
   "Setup electric pairing of backticks in `monad-mode'."
   (when (bound-and-true-p electric-pair-mode)
-    (setq-local electric-pair-pairs
-                (append electric-pair-pairs '((?` . ?`))))
-    (setq-local electric-pair-text-pairs
-                (append electric-pair-text-pairs '((?` . ?`))))))
+    (setq-local electric-pair-pairs electric-pair-pairs)
+    (cl-pushnew '(?` . ?`) electric-pair-pairs :test #'equal)
+    (setq-local electric-pair-text-pairs electric-pair-text-pairs)
+    (cl-pushnew '(?` . ?`) electric-pair-text-pairs :test #'equal)))
 
 ;; Assembly syntax highlighting support
 (defun monad-syntax-propertize (start end)
@@ -750,6 +750,15 @@ paragraph text editing."
           (delete-region delete-start origin)
           t)))))
 
+(defun monad--electric-pair-adjacent-p ()
+  "Return non-nil when point is between adjacent electric-pair delimiters."
+  (let ((open (char-before))
+        (close (char-after)))
+    (and open close
+         (or (eq (cdr (assq open electric-pair-pairs)) close)
+             (eq (cdr (assq open electric-pair-text-pairs)) close)
+             (eq (matching-paren open) close)))))
+
 (defun monad-backward-delete-char-untabify (arg)
   "Delete backward, with paragraph-comment content deletion.
 With point in a `-|' paragraph comment, backspace ignores indentation
@@ -761,6 +770,9 @@ Everywhere else, behave like `backward-delete-char-untabify'."
     (delete-region (region-beginning) (region-end)))
    ((and (= arg 1)
          (monad--paragraph-comment-backward-delete)))
+   ((and (bound-and-true-p electric-pair-mode)
+         (monad--electric-pair-adjacent-p))
+    (electric-pair-delete-pair arg))
    (t
     (backward-delete-char-untabify arg))))
 
@@ -865,6 +877,29 @@ excess whitespace to the right."
         (setq count (1+ count)))
       count)))
 
+(defun monad--in-refinement-type-body-p ()
+  "Return non-nil when point is inside a `type' refinement body."
+  (save-excursion
+    (condition-case nil
+        (progn
+          (up-list -1)
+          (when (eq (char-after) ?\{)
+            (let ((brace-pos (point))
+                  (brace-indent (current-indentation)))
+              (or (save-excursion
+                    (beginning-of-line)
+                    (re-search-forward "\\_<type\\_>" brace-pos t))
+                  (catch 'found
+                    (while (not (bobp))
+                      (forward-line -1)
+                      (unless (looking-at "^[ \t]*$")
+                        (if (< (current-indentation) brace-indent)
+                            (throw 'found
+                                   (looking-at "^[ \t]*(?type\\_>"))
+                          (throw 'found nil))))
+                    nil)))))
+      (error nil))))
+
 
 ;; TODO We could also show eldoc showing the current param we are binding in pmatch before ->
 (defun monad-insert-arrow-annotation ()
@@ -873,6 +908,7 @@ Dynamically counts expected parameters from peer lines or parent signature,
 and aligns '-> ' to match previous lines. Handles type signatures and guards automatically."
   (when (and (eq (char-before) ?\s)
              (not (monad--in-layout-block-p))
+             (not (monad--in-refinement-type-body-p))
              ;; Prevent triggering if the user manually typed "-> "
              (not (and (>= (point) 3)
                        (string= (buffer-substring-no-properties (- (point) 3) (1- (point))) "->")))
@@ -916,7 +952,8 @@ and aligns '-> ' to match previous lines. Handles type signatures and guards aut
                  (current-indent (save-excursion (beginning-of-line) (current-indentation)))
                  (expected-sexps nil)
                  (target-col nil)
-                 (trigger-insert nil))
+                 (trigger-insert nil)
+                 (valid-arrow-context nil))
 
             (save-excursion
               (catch 'found
@@ -932,27 +969,31 @@ and aligns '-> ' to match previous lines. Handles type signatures and guards aut
                       (let ((arrow-start (- (match-end 0) 2)))
                         (unless is-guard-line
                           (setq expected-sexps (monad--count-sexps (line-beginning-position) arrow-start)))
-                        (setq target-col (save-excursion (goto-char arrow-start) (current-column)))
-                        (throw 'found t))))
+                        (setq target-col (save-excursion (goto-char arrow-start) (current-column))))))
                    ((< (current-indentation) current-indent)
                     ;; Parent line: parse header to find expected parameters
                     (beginning-of-line)
                     (if is-guard-line
                         (throw 'found t) ; Guards don't inherit expected-sexps from parent
                       (cond
-                       ((looking-at "^\\s-*\\(?:match\\|case\\)\\_>")
-                        (setq expected-sexps 1)
+                       ((looking-at "^\\s-*(?match\\_>.*\\_<with\\_>")
+                        (setq valid-arrow-context t)
+                        (unless expected-sexps
+                          (setq expected-sexps 1))
                         (throw 'found t))
                        ((looking-at "^\\s-*define\\s-+\\(?:\\sw\\|\\s_\\)+\\s-+::")
                         ;; Haskell style: define name :: A -> B -> C
+                        (setq valid-arrow-context t)
                         (re-search-forward "::")
                         (let ((count 0) (limit (line-end-position)))
                           (while (re-search-forward "->" limit t)
                             (when (= (car (syntax-ppss)) 0) (setq count (1+ count))))
-                          (setq expected-sexps (max 1 count)))
+                          (unless expected-sexps
+                            (setq expected-sexps (max 1 count))))
                         (throw 'found t))
                        ((looking-at "^\\s-*(define\\s-+(")
                         ;; Lisp style: (define (name p1 p2) or (define (name . Int -> Int)
+                        (setq valid-arrow-context t)
                         (let ((count 0))
                           (condition-case nil
                               (progn
@@ -970,11 +1011,15 @@ and aligns '-> ' to match previous lines. Handles type signatures and guards aut
                                 (let ((arrow-count 0))
                                   (while (re-search-forward "->" (line-end-position) t)
                                     (setq arrow-count (1+ arrow-count)))
-                                  (setq expected-sexps (max 1 arrow-count))))
-                            (setq expected-sexps count)))
+                                  (unless expected-sexps
+                                    (setq expected-sexps (max 1 arrow-count)))))
+                            (unless expected-sexps
+                              (setq expected-sexps count))))
                         (throw 'found t))
-                       (t
-                        (setq expected-sexps 1)
+                       ((looking-at "^\\s-*define\\s-+\\(?:\\sw\\|\\s_\\)+\\s-+.*->")
+                        (setq valid-arrow-context t)
+                        (unless expected-sexps
+                          (setq expected-sexps 1))
                         (throw 'found t)))))))))
 
             ;; Evaluate if we should trigger the arrow insertion
@@ -989,7 +1034,9 @@ and aligns '-> ' to match previous lines. Handles type signatures and guards aut
                             (string-prefix-p "(" guard-str)
                             (string-match-p "\\(?:\\`\\|\\s-\\)\\(?:=\\|<=\\|!=\\|>=\\|<\\|>\\)\\s-+\\S-" guard-str))
                     (setq trigger-insert t)))
-              (when (and expected-sexps (= current-sexp-count expected-sexps))
+              (when (and valid-arrow-context
+                         expected-sexps
+                         (= current-sexp-count expected-sexps))
                 (setq trigger-insert t)))
 
             ;; Execute insertion and alignment
@@ -1816,6 +1863,8 @@ Priority rules:
   (add-hook 'xref-backend-functions #'monad-xref-backend nil t)
   (add-hook 'completion-at-point-functions #'monad-completion-at-point nil t)
   (add-hook 'post-self-insert-hook #'monad-post-self-insert nil t)
+  (add-hook 'electric-pair-mode-hook #'monad--setup-electric-pair nil t)
+  (monad--setup-electric-pair)
   (rainbow-delimiters-mode 1)
   (when (fboundp 'porg-mode)
     (porg-mode 1))
@@ -2433,6 +2482,13 @@ Fully preserves undo behavior for self-insertion."
   (let* ((at-eol (save-excursion (skip-chars-forward " \t)") (eolp)))
          (ppss (syntax-ppss))
          (paren-depth (car ppss))
+         (at-target-entry-end
+          (save-excursion
+            (skip-chars-forward " \t")
+            (when (eq (char-after) ?\])
+              (forward-char 1)
+              (skip-chars-forward " \t)")
+              (eolp))))
          (bare-block-header
           (and at-eol
                (save-excursion
@@ -2495,6 +2551,8 @@ Fully preserves undo behavior for self-insertion."
                         ":: " prev-type)))))))
 
       ;; 3. Smart Newline Execution
+      (when (and in-target-block at-target-entry-end)
+        (search-forward "]" (line-end-position) t))
       (cond
        ;; Refinement type set body: split before the closing brace and start a guard.
        ((save-excursion
@@ -2545,7 +2603,7 @@ Fully preserves undo behavior for self-insertion."
           (indent-to indent)))
 
        ;; If not at EOL, fallback to standard newline to avoid messing up mid-line splits
-       ((not at-eol)
+       ((and (not at-eol) (not (and in-target-block at-target-entry-end)))
         (newline-and-indent))
 
        ;; Bare layout/type headers use the same two-space body indentation as define.
@@ -2613,7 +2671,7 @@ Fully preserves undo behavior for self-insertion."
        ;; 4. Fallback for Target blocks (insert [])
        (t
         (newline-and-indent)
-        (when (and at-eol in-target-block)
+        (when (and (or at-eol at-target-entry-end) in-target-block)
           (insert "[]")
           (backward-char)))))))
 
