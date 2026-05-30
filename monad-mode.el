@@ -169,7 +169,7 @@
 (define-abbrev-table 'monad-mode-abbrev-table ())
 
 (defconst monad-keywords
-  '("define" "def" "lambda" "match" "with" "layout" "type" "data" "deriving"
+  '("define" "variable" "def" "lambda" "match" "with" "layout" "type" "data" "deriving"
     "let" "letrec" "let*" "cond" "case" "if" "then" "else"
     "and" "or" "not" "quote" "unquote" "quasiquote"
     "begin" "when" "unless" "error" "instance" "asm"
@@ -207,6 +207,15 @@ When NAME is nil, the returned regexp captures the layout name in group 1."
           "\\(" (or (and name (regexp-quote name))
                     monad--identifier-regexp)
           "\\)\\_>"))
+
+(defun monad--capitalize-initial-at (pos)
+  "Uppercase the character at POS, preserving the rest of the name."
+  (let ((char (char-after pos)))
+    (when (and char (not (= char (upcase char))))
+      (save-excursion
+        (goto-char pos)
+        (delete-char 1)
+        (insert-char (upcase char))))))
 
 (defun monad--definition-name-regexps (&optional name)
   "Return regexps matching top-level definition forms for NAME."
@@ -637,12 +646,12 @@ leaving any `invisible' properties set by other modes (e.g. `porg-mode') intact.
       (beginning-of-line)
       (delete-horizontal-space))
     (beginning-of-line))
-   ;; Previous non-blank line is a bare define header -> indent to 2
+   ;; Previous non-blank line is a bare block header -> indent to 2
    ((save-excursion
       (forward-line -1)
       (while (and (not (bobp)) (looking-at "^\\s-*$"))
         (forward-line -1))
-      (looking-at "^define\\s-+"))
+      (looking-at "^\\(?:define\\|layout\\|type\\)\\s-+"))
     (let* ((old-col (current-column))
            (old-indent (current-indentation)))
       (save-excursion
@@ -755,17 +764,33 @@ Everywhere else, behave like `backward-delete-char-untabify'."
    (t
     (backward-delete-char-untabify arg))))
 
-(defun monad-insert-set-member ()
-  "Replace space with ∈ when inside a set comprehension and preceded by space."
-  (when (and (eq (char-before) ?\s)
-             (save-excursion
-               (backward-char 1)
-               (and (eq (char-before) ?\s)
-                    (condition-case nil
-                        (save-excursion (up-list -1) (eq (char-after) ?{))
-                      (error nil)))))
-    (delete-char -1)
-    (insert "∈ ")))
+(defun monad--in-layout-block-p ()
+  "Return non-nil when point is inside a parenthesized or bare layout block."
+  (or (save-excursion
+        (catch 'found
+          (condition-case nil
+              (while t
+                (up-list -1)
+                (when (and (eq (char-after) ?\()
+                           (save-excursion
+                             (forward-char 1)
+                             (skip-chars-forward " \t\n")
+                             (looking-at "layout\\_>")))
+                  (throw 'found t)))
+            (error nil))))
+      (save-excursion
+        (let ((indent (current-indentation)))
+          (catch 'found
+            (while (not (bobp))
+              (forward-line -1)
+              (unless (looking-at "^[ \t]*$")
+                (let ((previous-indent (current-indentation)))
+                  (cond
+                   ((and (< previous-indent indent)
+                         (looking-at "^[ \t]*layout\\s-+"))
+                    (throw 'found t))
+                   ((< previous-indent indent)
+                    (throw 'found nil)))))))))))
 
 (defun monad-insert-type-annotation ()
   "Insert ':: ' when typing a space inside [].
@@ -780,18 +805,7 @@ excess whitespace to the right."
               (save-excursion (up-list -1) (eq (char-after) ?\[))
             (error nil)))
     (let* ((in-layout
-            (save-excursion
-              (catch 'found
-                (condition-case nil
-                    (while t
-                      (up-list -1)
-                      (when (and (eq (char-after) ?\()
-                                 (save-excursion
-                                   (forward-char 1)
-                                   (skip-chars-forward " \t\n")
-                                   (looking-at "layout\\_>")))
-                        (throw 'found t)))
-                  (error nil)))))
+            (monad--in-layout-block-p))
            (triggered
             (if in-layout
                 (and (eq (char-before) ?\s)
@@ -858,6 +872,7 @@ excess whitespace to the right."
 Dynamically counts expected parameters from peer lines or parent signature,
 and aligns '-> ' to match previous lines. Handles type signatures and guards automatically."
   (when (and (eq (char-before) ?\s)
+             (not (monad--in-layout-block-p))
              ;; Prevent triggering if the user manually typed "-> "
              (not (and (>= (point) 3)
                        (string= (buffer-substring-no-properties (- (point) 3) (1- (point))) "->")))
@@ -1039,7 +1054,6 @@ and aligns '-> ' to match previous lines. Handles type signatures and guards aut
                                 (looking-at "module\\b")))
                      (throw 'found t)))
                (error nil))))))
-    (monad-insert-set-member)
     (unless in-module
       (monad-insert-type-annotation)
       (monad-insert-arrow-annotation))))
@@ -2419,19 +2433,30 @@ Fully preserves undo behavior for self-insertion."
   (let* ((at-eol (save-excursion (skip-chars-forward " \t)") (eolp)))
          (ppss (syntax-ppss))
          (paren-depth (car ppss))
+         (bare-block-header
+          (and at-eol
+               (save-excursion
+                 (beginning-of-line)
+                 (when (looking-at (concat "^[ \t]*(?\\(layout\\|type\\)\\s-+"
+                                           "\\(" monad--identifier-regexp "\\)"
+                                           "\\_>[ \t)]*$"))
+                   (list (match-string-no-properties 1)
+                         (match-beginning 2)
+                         (current-indentation))))))
          ;; Renamed variable to reflect it handles multiple block types
-         (in-target-block (save-excursion
-                            (catch 'found
-                              (condition-case nil
-                                  (while t
-                                    (up-list -1)
-                                    (when (and (eq (char-after) ?\()
-                                               (save-excursion
-                                                 (forward-char 1)
-                                                 (skip-chars-forward " \t\n")
-                                                 (looking-at "\\(?:layout\\|module\\)\\_>")))
-                                      (throw 'found t)))
-                                (error nil))))))
+         (in-target-block (or (monad--in-layout-block-p)
+                              (save-excursion
+                                (catch 'found
+                                  (condition-case nil
+                                      (while t
+                                        (up-list -1)
+                                        (when (and (eq (char-after) ?\()
+                                                   (save-excursion
+                                                     (forward-char 1)
+                                                     (skip-chars-forward " \t\n")
+                                                     (looking-at "\\(?:layout\\|module\\)\\_>")))
+                                          (throw 'found t)))
+                                    (error nil)))))))
 
     ;; 1. If currently inside an empty target [] block, just jump inside it
     (if (and in-target-block
@@ -2444,25 +2469,98 @@ Fully preserves undo behavior for self-insertion."
 
       ;; 2. Target block layout type inheritance
       (when in-target-block
-        (save-excursion
-          (beginning-of-line)
-          (when (re-search-forward "\\[[ \t]*[^: \t]+[ \t]*::\\([ \t]*\\)\\][ \t)]*$" (line-end-position) t)
-            (let ((spaces-start (match-beginning 1))
-                  (spaces-end (match-end 1)))
-              (save-excursion
-                (forward-line -1)
-                (beginning-of-line)
-                (when (re-search-forward "::[ \t]*\\([^]\n]+?\\)[ \t]*\\]" (line-end-position) t)
-                  (let ((prev-type (match-string 1)))
-                    (goto-char spaces-start)
-                    (delete-region spaces-start spaces-end)
-                    (insert " " prev-type))))))))
+        (let (prev-type target-col)
+          (save-excursion
+            (forward-line -1)
+            (beginning-of-line)
+            (when (re-search-forward "::[ \t]*\\([^]\n]+?\\)[ \t]*\\]" (line-end-position) t)
+              (setq prev-type (match-string 1)
+                    target-col (save-excursion
+                                 (goto-char (match-beginning 0))
+                                 (current-column)))))
+          (when prev-type
+            (save-excursion
+              (beginning-of-line)
+              (cond
+               ((re-search-forward "\\[[ \t]*[^: \t]+[ \t]*::\\([ \t]*\\)\\][ \t)]*$" (line-end-position) t)
+                (delete-region (match-beginning 1) (match-end 1))
+                (goto-char (match-beginning 1))
+                (insert " " prev-type))
+               ((progn
+                  (beginning-of-line)
+                  (re-search-forward "\\[[ \t]*[^]: \t]+\\([ \t]*\\)\\][ \t)]*$" (line-end-position) t))
+                (delete-region (match-beginning 1) (match-end 1))
+                (goto-char (match-beginning 1))
+                (insert (make-string (max 1 (- target-col (current-column))) ?\s)
+                        ":: " prev-type)))))))
 
       ;; 3. Smart Newline Execution
       (cond
+       ;; Refinement type set body: split before the closing brace and start a guard.
+       ((save-excursion
+          (and (condition-case nil
+                   (save-excursion
+                     (up-list -1)
+                     (eq (char-after) ?{))
+                 (error nil))
+               (let ((line-before-point
+                      (buffer-substring-no-properties (line-beginning-position)
+                                                      (point))))
+                 (and (string-match-p "∈" line-before-point)
+                      (not (string-match-p "^\\s-*|" line-before-point))))
+               (progn
+                 (skip-chars-forward " \t")
+                 (eq (char-after) ?}))))
+        (delete-region (point)
+                       (save-excursion
+                         (skip-chars-forward " \t")
+                         (point)))
+        (newline)
+        (indent-to (save-excursion
+                     (forward-line -1)
+                     (current-indentation)))
+        (insert "|  ")
+        (backward-char))
+
+       ;; Refinement guard line: split before the closing brace and indent continuation.
+       ((save-excursion
+          (and (condition-case nil
+                   (save-excursion
+                     (up-list -1)
+                     (eq (char-after) ?{))
+                 (error nil))
+               (string-match-p "^\\s-*|"
+                               (buffer-substring-no-properties
+                                (line-beginning-position)
+                                (point)))
+               (progn
+                 (skip-chars-forward " \t")
+                 (eq (char-after) ?}))))
+        (let ((indent (+ (current-indentation) 2)))
+          (delete-region (point)
+                         (save-excursion
+                           (skip-chars-forward " \t")
+                           (point)))
+          (newline)
+          (indent-to indent)))
+
        ;; If not at EOL, fallback to standard newline to avoid messing up mid-line splits
        ((not at-eol)
         (newline-and-indent))
+
+       ;; Bare layout/type headers use the same two-space body indentation as define.
+       (bare-block-header
+        (pcase-let ((`(,kind ,name-start ,indent) bare-block-header))
+          (monad--capitalize-initial-at name-start)
+          (newline)
+          (indent-to (+ indent 2))
+          (pcase kind
+            ("layout"
+             (insert "[]")
+             (backward-char))
+            ("type"
+             (insert "{  }")
+             (backward-char 2)))))
 
        ;; Pattern matching / Guard logic (only trigger if we are at top-level depth)
        ((and (<= paren-depth 1) (not in-target-block))
@@ -2470,7 +2568,8 @@ Fully preserves undo behavior for self-insertion."
               (indent (current-indentation)))
           (cond
            ;; Case A: Continuing a guard line (starts with |)
-           ((string-match-p "^|" line-str)
+           ((and (string-match-p "^|" line-str)
+                 (not (string-match-p "}" line-str)))
             (newline)
             (indent-to indent)
             (insert "| "))
