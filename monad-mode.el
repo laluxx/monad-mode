@@ -169,7 +169,7 @@
 (define-abbrev-table 'monad-mode-abbrev-table ())
 
 (defconst monad-keywords
-  '("define" "variable" "def" "lambda" "match" "with" "layout" "type" "data" "deriving"
+  '("define" "method" "variable" "def" "lambda" "match" "with" "layout" "type" "data" "deriving"
     "let" "letrec" "let*" "cond" "case" "if" "then" "else"
     "and" "or" "not" "quote" "unquote" "quasiquote"
     "begin" "when" "unless" "error" "instance" "asm"
@@ -186,8 +186,8 @@
 When NAME is nil, the returned regexp captures the definition name in
 group 1.  Supported forms include `(define (name ...)',
 `(define [name :: Type] ...)', `(define name ...)', and
-`define name :: Type'."
-  (concat "^\\(?:([ \t]*\\)?define\\s-+\\(?:([ \t\n]*\\|\\[?\\)"
+`define name :: Type'.  `method' is accepted in place of `define'."
+  (concat "^\\s-*\\(?:([ \t]*\\)?\\(?:define\\|method\\)\\s-+\\(?:([ \t\n]*\\|\\[?\\)"
           "\\(" (or (and name (regexp-quote name))
                     monad--identifier-regexp)
           "\\)\\_>"))
@@ -227,7 +227,7 @@ When NAME is nil, the returned regexp captures the layout name in group 1."
   "Return the Haskell-style signature line for define NAME, or nil."
   (save-excursion
     (goto-char (point-min))
-    (let ((rx (concat "^define\\s-+\\("
+    (let ((rx (concat "^\\s-*\\(?:define\\|method\\)\\s-+\\("
                       (regexp-quote name)
                       "\\)\\_>\\s-+::\\s-*\\(.+\\)$")))
       (when (re-search-forward rx nil t)
@@ -238,7 +238,8 @@ When NAME is nil, the returned regexp captures the layout name in group 1."
   (save-excursion
     (goto-char (line-beginning-position))
     (looking-at
-     (concat "^define\\s-+" monad--identifier-regexp "\\_>\\s-+::"))))
+     (concat "^\\s-*\\(?:define\\|method\\)\\s-+"
+             monad--identifier-regexp "\\_>\\s-+::"))))
 
 ;;; Imenu — flat index with cached docstring annotations
 
@@ -646,19 +647,25 @@ leaving any `invisible' properties set by other modes (e.g. `porg-mode') intact.
       (beginning-of-line)
       (delete-horizontal-space))
     (beginning-of-line))
-   ;; Previous non-blank line is a bare block header -> indent to 2
+   ;; Previous non-blank line is a bare block header -> indent one level deeper.
    ((save-excursion
       (forward-line -1)
       (while (and (not (bobp)) (looking-at "^\\s-*$"))
         (forward-line -1))
-      (looking-at "^\\(?:define\\|layout\\|type\\)\\s-+"))
+      (looking-at "^\\s-*\\(?:define\\|method\\|layout\\|type\\)\\s-+\\|^\\s-*where\\_>"))
     (let* ((old-col (current-column))
-           (old-indent (current-indentation)))
+           (old-indent (current-indentation))
+           (target-indent (save-excursion
+                            (forward-line -1)
+                            (while (and (not (bobp)) (looking-at "^\\s-*$"))
+                              (forward-line -1))
+                            (+ (current-indentation) 2))))
       (save-excursion
         (beginning-of-line)
         (delete-horizontal-space)
-        (indent-to 2))
-      (move-to-column (max 2 (+ 2 (- old-col old-indent))))))
+        (indent-to target-indent))
+      (move-to-column (max target-indent
+                           (+ target-indent (- old-col old-indent))))))
    ;; Previous non-blank line is an indented wisp body line -> match its indent
    ;; but NOT if it's inside a paragraph comment (blank line separates us)
    ((save-excursion
@@ -877,6 +884,19 @@ excess whitespace to the right."
         (setq count (1+ count)))
       count)))
 
+(defun monad--delete-space-and-forward-arrow ()
+  "Delete horizontal space at point and one following `->' token."
+  (delete-region (point)
+                 (save-excursion
+                   (skip-chars-forward " \t")
+                   (point)))
+  (when (looking-at "->")
+    (delete-region (point) (match-end 0))
+    (delete-region (point)
+                   (save-excursion
+                     (skip-chars-forward " \t")
+                     (point)))))
+
 (defun monad--in-refinement-type-body-p ()
   "Return non-nil when point is inside a `type' refinement body."
   (save-excursion
@@ -907,43 +927,63 @@ excess whitespace to the right."
 Dynamically counts expected parameters from peer lines or parent signature,
 and aligns '-> ' to match previous lines. Handles type signatures and guards automatically."
   (when (and (eq (char-before) ?\s)
-             (not (monad--in-layout-block-p))
+             (or (not (monad--in-layout-block-p))
+                 (save-excursion
+                   (beginning-of-line)
+                   (looking-at "^\\s-*\\(?:define\\|method\\)\\s-+\\(?:\\sw\\|\\s_\\)+\\s-+::")))
              (not (monad--in-refinement-type-body-p))
              ;; Prevent triggering if the user manually typed "-> "
              (not (and (>= (point) 3)
-                       (string= (buffer-substring-no-properties (- (point) 3) (1- (point))) "->")))
+                       (string= (buffer-substring-no-properties (- (point) 3) (1- (point))) "->")
+                       (not (save-excursion
+                              (beginning-of-line)
+                              (looking-at "^\\s-*\\(?:define\\|method\\)\\s-+\\(?:\\sw\\|\\s_\\)+\\s-+::")))))
              ;; Ensure we are exactly after a sexp
              (save-excursion
                (backward-char 1)
                (let ((end-of-sexp (point)))
                  (beginning-of-line)
                  (skip-chars-forward " \t")
-                 (condition-case nil
-                     (progn
-                       ;; Move forward until we pass end-of-sexp to verify it's a boundary
-                       (while (< (point) end-of-sexp)
-                         (forward-sexp 1))
-                       (= (point) end-of-sexp))
-                   (error nil)))))
+                 (or (string-suffix-p
+                      "->"
+                      (string-trim-right
+                       (buffer-substring-no-properties (line-beginning-position)
+                                                       end-of-sexp)))
+                     (condition-case nil
+                         (progn
+                           ;; Move forward until we pass end-of-sexp to verify it's a boundary
+                           (while (< (point) end-of-sexp)
+                             (forward-sexp 1))
+                           (= (point) end-of-sexp))
+                       (error nil))))))
 
     ;; Determine context
     (let* ((line-beg (line-beginning-position))
            (line-str (buffer-substring-no-properties line-beg (line-end-position)))
            (text-before (string-trim-right (buffer-substring-no-properties line-beg (1- (point)))))
-           (is-type-sig (or (string-match-p "^\\s-*define\\s-+\\(?:\\sw\\|\\s_\\)+\\s-+::" line-str)
+           (is-type-sig (or (string-match-p "^\\s-*\\(?:define\\|method\\)\\s-+\\(?:\\sw\\|\\s_\\)+\\s-+::" line-str)
                             (string-match-p "^\\s-*::" line-str)))
            (is-guard-line (string-match-p "^\\s-*|\\s-*" line-str)))
 
-      (if (and is-type-sig (not (string-suffix-p "::" text-before)))
+      (unless (string-suffix-p "|" text-before)
+        (if (and is-type-sig (not (string-suffix-p "::" text-before)))
           ;; FAST PATH: Just insert the arrow, no counting or alignment needed.
           ;; (Bypassed if the token right before the space was "::")
           (progn
-            (delete-char -1)
-            (insert " -> ")
-            (delete-region (point)
-                           (save-excursion
-                             (skip-chars-forward " \t")
-                             (point))))
+            (let ((repeat-type
+                   (when (string-match "->\\s-*\\'" text-before)
+                     (let ((type-prefix
+                            (string-trim-right
+                             (substring text-before 0 (match-beginning 0)))))
+                       (when (string-match ".*\\(?:->\\|::\\)\\s-*\\(.+\\)\\'" type-prefix)
+                         (string-trim (match-string 1 type-prefix)))))))
+              (if repeat-type
+                  (progn
+                    (delete-horizontal-space)
+                    (insert " " repeat-type " -> "))
+                (delete-char -1)
+                (insert " -> ")))
+            (monad--delete-space-and-forward-arrow))
 
         ;; REGULAR PATH: Pattern matching parameter counting, guards, and alignment
         ;; Prevent insertion if an arrow already exists on this line!
@@ -981,7 +1021,7 @@ and aligns '-> ' to match previous lines. Handles type signatures and guards aut
                         (unless expected-sexps
                           (setq expected-sexps 1))
                         (throw 'found t))
-                       ((looking-at "^\\s-*define\\s-+\\(?:\\sw\\|\\s_\\)+\\s-+::")
+                       ((looking-at "^\\s-*\\(?:define\\|method\\)\\s-+\\(?:\\sw\\|\\s_\\)+\\s-+::")
                         ;; Haskell style: define name :: A -> B -> C
                         (setq valid-arrow-context t)
                         (re-search-forward "::")
@@ -1070,11 +1110,8 @@ and aligns '-> ' to match previous lines. Handles type signatures and guards aut
                         (insert (make-string padding ?\s) "-> "))))
                 ;; 3. No previous line to align to (first pattern arm)
                 (insert " -> "))
-              ;; Vacuum up whitespace to the right
-              (delete-region (point)
-                             (save-excursion
-                               (skip-chars-forward " \t")
-                               (point))))))))))
+              ;; Vacuum up whitespace and a pre-existing arrow to the right.
+              (monad--delete-space-and-forward-arrow)))))))))
 
 
 
@@ -1295,13 +1332,13 @@ and aligns '-> ' to match previous lines. Handles type signatures and guards aut
       (1 font-lock-string-face t))
 
     ;; Wisp-style (Haskell-like) defines — order matters: -> check before plain ::
-    '("^define\\s-+\\(\\(?:\\sw\\|\\s_\\)+\\)\\s-+::[^\n]*->"
+    '("^\\s-*\\(?:define\\|method\\)\\s-+\\(\\(?:\\sw\\|\\s_\\)+\\)\\s-+::[^\n]*->"
       (1 font-lock-function-name-face))
-    '("^define\\s-+\\(\\(?:\\sw\\|\\s_\\)+\\)\\s-+::[^\n]*"
+    '("^\\s-*\\(?:define\\|method\\)\\s-+\\(\\(?:\\sw\\|\\s_\\)+\\)\\s-+::[^\n]*"
       (1 font-lock-function-name-face))
-    '("^define\\s-+(\\(\\(?:\\sw\\|\\s_\\)+\\)"
+    '("^\\s-*\\(?:define\\|method\\)\\s-+(\\(\\(?:\\sw\\|\\s_\\)+\\)"
       (1 font-lock-function-name-face))
-    '("^define\\s-+\\(\\(?:\\sw\\|\\s_\\)+\\)\\s-+->"
+    '("^\\s-*\\(?:define\\|method\\)\\s-+\\(\\(?:\\sw\\|\\s_\\)+\\)\\s-+->"
       (1 font-lock-function-name-face))
 
     '("(\\s-*\\(asm\\)\\_>" 1 font-lock-keyword-face)
@@ -1317,10 +1354,10 @@ and aligns '-> ' to match previous lines. Handles type signatures and guards aut
       (2 font-lock-function-name-face t))
     '("#-\\sw+" . 'shadow)
     '("#-+\\>" . 'shadow)
-    '("(\\(define\\)\\s-+(\\(\\(?:\\sw\\|\\s_\\)+\\)"
+    '("(\\(define\\|method\\)\\s-+(\\(\\(?:\\sw\\|\\s_\\)+\\)"
       (1 font-lock-keyword-face)
       (2 font-lock-function-name-face))
-    '("(\\(define\\)\\s-+\\[?\\(\\(?:\\sw\\|\\s_\\)+\\)"
+    '("(\\(define\\|method\\)\\s-+\\[?\\(\\(?:\\sw\\|\\s_\\)+\\)"
       (1 font-lock-keyword-face)
       (2 font-lock-variable-name-face)))
    (let ((asm-keywords (monad-asm-get-font-lock-keywords)))
@@ -2620,6 +2657,15 @@ Fully preserves undo behavior for self-insertion."
              (insert "{  }")
              (backward-char 2)))))
 
+       ;; Where opens a plain block, including inside layout blocks.
+       ((string= (string-trim (buffer-substring-no-properties
+                               (line-beginning-position)
+                               (line-end-position)))
+                 "where")
+        (let ((indent (current-indentation)))
+          (newline)
+          (indent-to (+ indent 2))))
+
        ;; Pattern matching / Guard logic (only trigger if we are at top-level depth)
        ((and (<= paren-depth 1) (not in-target-block))
         (let ((line-str (string-trim (buffer-substring-no-properties (line-beginning-position) (line-end-position))))
@@ -2632,7 +2678,18 @@ Fully preserves undo behavior for self-insertion."
             (indent-to indent)
             (insert "| "))
 
-           ;; Case B: End of a pattern clause (has ->, does not start with |)
+           ;; Case B: End of an inline guard arm.
+           ((string-match-p "\\_<|\\_>.*->" line-str)
+            (let ((guard-column
+                   (save-excursion
+                     (beginning-of-line)
+                     (search-forward "|" (line-end-position) t)
+                     (1- (current-column)))))
+              (newline)
+              (indent-to guard-column)
+              (insert "| ")))
+
+           ;; Case C: End of a pattern clause (has ->, does not start with |)
            ((string-match-p "->" line-str)
             (newline-and-indent)
             ;; Check if the first arg in the define signature is a List or [a]
@@ -2643,7 +2700,7 @@ Fully preserves undo behavior for self-insertion."
               (insert "[]")
               (backward-char)))
 
-           ;; Case C: Start of guards (clause head without ->)
+           ;; Case D: Start of guards (clause head without ->)
            ((and (not (string-empty-p line-str))
                  (not (string-match-p "->" line-str))
                  (not (string-match-p "::" line-str)))
@@ -2701,9 +2758,16 @@ Fully preserves undo behavior for self-insertion."
   "x" (lambda () (interactive) (insert "×"))
   "*" (lambda () (interactive) (insert "×"))
   "-" (lambda () (interactive) (insert "→"))
+  "_" (lambda () (interactive) (insert "↦"))
   "=" (lambda () (interactive) (insert "⇒"))
   "<" (lambda () (interactive) (insert "⟨"))
-  ">" (lambda () (interactive) (insert "⟩")))
+  ">" (lambda () (interactive) (insert "⟩"))
+  "[" (lambda () (interactive) (progn (insert "⌜⌝") (backward-char)))
+  "]" (lambda () (interactive) (insert "⌝"))
+  "{" (lambda () (interactive) (progn (insert "⌞⌟") (backward-char)))
+  "}" (lambda () (interactive) (insert "⌟")))
+
+
 
 ;;; Matrix literal support
 
