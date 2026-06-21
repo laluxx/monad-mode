@@ -153,6 +153,7 @@
     (modify-syntax-entry ?\) ")(  " st)
     ;; Comments
     (modify-syntax-entry ?\; "<   " st)
+    (modify-syntax-entry ?\| ". 23" st)
     ;; Strings
     (modify-syntax-entry ?\" "\"   " st)
     ;; Character quote
@@ -1288,6 +1289,36 @@ and aligns '-> ' to match previous lines. Handles type signatures and guards aut
           (set-match-data (list open-start para-end)))))
       t)))
 
+(defun monad-define-line-comment-matcher (limit)
+  "Match `| ...' comments in `define name value | ...' lines up to LIMIT."
+  (let (found)
+    (while (and (not found)
+                (re-search-forward "^[ \t]*define\\_>" limit t))
+      (let* ((line-beg (line-beginning-position))
+             (line-end (line-end-position))
+             (comment-start
+              (save-excursion
+                (save-restriction
+                  (narrow-to-region line-beg line-end)
+                  (goto-char (match-end 0))
+                  (skip-chars-forward " \t")
+                  (condition-case nil
+                      (progn
+                        (forward-sexp 1)
+                        (skip-chars-forward " \t")
+                        (forward-sexp 1)
+                        (skip-chars-forward " \t")
+                        (and (eq (char-after) ?|)
+                             (point)))
+                    (error nil))))))
+        (if (and comment-start (< comment-start limit))
+            (let ((comment-end (min line-end limit)))
+              (set-match-data (list comment-start comment-end))
+              (goto-char comment-end)
+              (setq found t))
+          (goto-char (min line-end limit)))))
+    found))
+
 (defun monad-refinement-type-docstring-matcher (limit)
   "Match indented docstrings following refinement type bodies up to LIMIT."
   (let (found)
@@ -1327,6 +1358,7 @@ and aligns '-> ' to match previous lines. Handles type signatures and guards aut
                                                           'font-lock-multiline t)
                                        font-lock-comment-face)
                                    t))
+    '("^[ \t]*define[ \t]+[^ \t\n|]+[ \t]+[^ \t\n|]+[ \t]*\\(|.*\\)$" (1 font-lock-comment-face t))
     '(monad-refinement-type-docstring-matcher (0 font-lock-doc-face t))
     '("\\<include\\s-+\\(<[^>\n]+>\\)"
       (1 font-lock-string-face t))
@@ -1346,6 +1378,9 @@ and aligns '-> ' to match previous lines. Handles type signatures and guards aut
           'font-lock-keyword-face)
     '("::" . font-lock-builtin-face)
     '(":\\sw+" . font-lock-builtin-face)
+    ;; :doc "string" — highlight docstrings anywhere, overriding default string face
+    '(":doc[ \t\n]+\\(\"\\(?:[^\"\\]\\|\\\\.\\)*\"\\)"
+      (1 font-lock-doc-face t))
     '(monad-char-literal-matcher . font-lock-string-face)
     '("\\<_\\>" . 'shadow)
     '("#\\+\\>" . 'shadow)
