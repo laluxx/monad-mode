@@ -103,8 +103,8 @@
   :prefix "monad-"
   :group 'languages)
 
-(defcustom monad-highlight-arrow nil
-  "If non-nil, highlight the -> arrow with keyword face."
+(defcustom monad-highlight-arrow t
+  "If non-nil, highlight Monad result arrows with `monad-arrow-face'."
   :type 'boolean
   :group 'monad)
 
@@ -141,6 +141,21 @@
 (defface monad-doc-code-face
   '((t :inherit font-lock-variable-name-face))
   "Face for infix backtick expressions like `fun`."
+  :group 'monad)
+
+(defface monad-guard-rail-face
+  '((t :inherit shadow))
+  "Face for Monad Unicode guard rail connectors."
+  :group 'monad)
+
+(defface monad-arrow-face
+  '((t :inherit shadow))
+  "Face for Monad result arrows."
+  :group 'monad)
+
+(defface monad-type-arrow-face
+  '((t :inherit default))
+  "Face for Monad type signature arrows."
   :group 'monad)
 
 (defvar monad-mode-syntax-table
@@ -528,6 +543,168 @@ Group 1 is the actual escape literal.")
             (set-match-data (list beg end beg end))
             (throw 'found t))))
       nil)))
+
+(defun monad--guard-rail-line-p (&optional pos)
+  "Return non-nil when POS is on a Unicode guard rail line."
+  (save-excursion
+    (when pos
+      (goto-char pos))
+    (let* ((line (buffer-substring-no-properties
+                  (line-beginning-position)
+                  (line-end-position)))
+           (h (regexp-quote (string ?\u2500)))
+           (ul (regexp-quote (string ?\u256D)))
+           (ll (regexp-quote (string ?\u2570)))
+           (ur (regexp-quote (string ?\u256E)))
+           (tee (regexp-quote (string ?\u252C)))
+           (mid (regexp-quote (string ?\u251C)))
+           (tri (regexp-quote (string ?\u25B6)))
+           (arrow (concat "\\(?:->\\|" tri "\\)"))
+           (open-left (concat ul h "+"))
+           (open-top (concat tee h "+"))
+           (open-right (concat h "+" ur))
+           (branch (concat mid h "+"))
+           (fallback (concat ll h "*" arrow)))
+      (or
+       (string-match-p
+        (concat "\\(?:\\`\\|[ \t]\\)\\(?:"
+                open-left "\\|" open-top
+                "\\)[ \t]+.*" arrow)
+        line)
+       (string-match-p
+        (concat "\\(?:\\`\\|[ \t]\\)" open-right "[ \t]*\\'")
+        line)
+       (string-match-p
+        (concat "\\(?:\\`\\|[ \t]\\)" open-right "[ \t]+.*" arrow)
+        line)
+       (string-match-p
+        (concat "\\(?:\\`\\|[ \t]\\)" branch "[ \t]+.*" arrow)
+        line)
+       (string-match-p
+        (concat "\\(?:\\`\\|[ \t]\\)" fallback "[ \t]+")
+        line)))))
+
+(defun monad-guard-rail-matcher (limit)
+  "Match Unicode guard rail connectors up to LIMIT."
+  (let* ((h (regexp-quote (string ?\u2500)))
+         (ul (regexp-quote (string ?\u256D)))
+         (ll (regexp-quote (string ?\u2570)))
+         (ur (regexp-quote (string ?\u256E)))
+         (tee (regexp-quote (string ?\u252C)))
+         (mid (regexp-quote (string ?\u251C)))
+         (tri (regexp-quote (string ?\u25B6)))
+         (fallback-arrow (concat "\\(?:->\\|" tri "\\)"))
+         (rail-rx
+          (concat "\\(?:"
+                  ul h "+"
+                  "\\|" tee h "+"
+                  "\\|" h "+" ur
+                  "\\|" mid h "+"
+                  "\\|" ll h "*" fallback-arrow
+                  "\\)"))
+         found)
+    (while (and (not found)
+                (re-search-forward rail-rx limit t))
+      (let ((beg (match-beginning 0))
+            (end (match-end 0)))
+        (if (and (monad--guard-rail-line-p beg)
+                 (monad--font-lock-code-position-p beg))
+            (progn
+              (set-match-data (list beg end beg end))
+              (goto-char end)
+              (setq found t))
+          (goto-char end))))
+    found))
+
+(defun monad-box-comment-matcher (limit)
+  "Match decorative box comments, but never Monad guard rails."
+  (let* ((h (regexp-quote (string ?\u2500)))
+         (ul (regexp-quote (string ?\u256D)))
+         (ll (regexp-quote (string ?\u2570)))
+         (ur (regexp-quote (string ?\u256E)))
+         (lr (regexp-quote (string ?\u256F)))
+         (comment-rx
+          (concat "\\(?:"
+                  "\\(" ul h "\\|" ll h "\\)[ \t]*\\(.*\\)$"
+                  "\\|"
+                  "^\\(.*?\\)\\([ \t]*\\(?:" ur "\\|" lr "\\)\\)\\(?:\\s-\\|$\\)"
+                  "\\)"))
+         found)
+    (while (and (not found)
+                (re-search-forward comment-rx limit t))
+      (let ((beg (match-beginning 0)))
+        (if (or (monad--guard-rail-line-p beg)
+                (not (monad--font-lock-code-position-p beg)))
+            (goto-char (match-end 0))
+          (setq found t))))
+    found))
+
+(defun monad--type-arrow-position-p (pos)
+  "Return non-nil when POS is on a type signature arrow."
+  (save-excursion
+    (goto-char pos)
+    (let ((line-beg (line-beginning-position))
+          (line-end (line-end-position)))
+      (or
+       (save-excursion
+         (goto-char line-beg)
+         (re-search-forward
+          (concat "^[ \t]*\\(?:define\\|method\\)\\s-+"
+                  monad--identifier-regexp
+                  "\\s-+::")
+          pos t))
+       (save-excursion
+         (goto-char line-beg)
+         (and (looking-at "^[ \t]*::")
+              (>= pos (match-end 0))))
+       (let ((open (save-excursion
+                     (search-backward "[" line-beg t)))
+             (close (save-excursion
+                      (search-forward "]" line-end t))))
+         (and open close
+              (< open pos)
+              (< pos close)
+              (save-excursion
+                (goto-char open)
+                (search-forward "::" pos t))))))))
+
+(defun monad-type-arrow-matcher (limit)
+  "Match Monad type signature arrows up to LIMIT."
+  (when monad-highlight-arrow
+    (let (found)
+      (while (and (not found)
+                  (re-search-forward "->" limit t))
+        (let ((beg (match-beginning 0))
+              (end (match-end 0)))
+          (if (and beg end
+                   (monad--font-lock-code-position-p beg)
+                   (monad--type-arrow-position-p beg))
+              (progn
+                (set-match-data (list beg end beg end))
+                (goto-char end)
+                (setq found t))
+            (goto-char end))))
+      found)))
+
+(defun monad-arrow-matcher (limit)
+  "Match Monad result arrows up to LIMIT."
+  (when monad-highlight-arrow
+    (let* ((tri (regexp-quote (string ?\u25B6)))
+           (arrow-rx (concat "\\(?:->\\|" tri "\\)"))
+           found)
+      (while (and (not found)
+                  (re-search-forward arrow-rx limit t))
+        (let ((beg (match-beginning 0))
+              (end (match-end 0)))
+          (if (and beg end
+                   (monad--font-lock-code-position-p beg)
+                   (not (monad--type-arrow-position-p beg)))
+              (progn
+                (set-match-data (list beg end beg end))
+                (goto-char end)
+                (setq found t))
+            (goto-char end))))
+      found)))
 
 (defun monad-error-string-matcher (limit)
   "Match an error payload after `error'.
@@ -1592,15 +1769,20 @@ LINE-END and return nil so trailing text is not treated as a docstring yet."
        nil)))))
 
 (defun monad-wisp-typed-value-docstring-matcher (limit)
-  "Match same-line docs after Wisp typed value defines up to LIMIT."
+  "Match docs after Wisp typed value defines up to LIMIT.
+Supports same-line docs and an indented doc block on following lines.
+This matcher is line-based so font-lock always moves forward."
   (let (found)
     (while (and (not found)
                 (re-search-forward
                  "^[ \t]*\\(?:([ \t]*\\)?\\(?:define\\|method\\)\\s-+\\["
                  limit t))
-      (let ((line-end (line-end-position))
-            (match-start nil)
-            (match-end nil))
+      (let ((header-indent (save-excursion
+                             (goto-char (match-beginning 0))
+                             (current-indentation)))
+            (line-end (min (line-end-position) limit))
+            match-start
+            match-end)
         (save-excursion
           (goto-char (match-end 0))
           (condition-case nil
@@ -1610,14 +1792,36 @@ LINE-END and return nil so trailing text is not treated as a docstring yet."
                 (skip-chars-forward " \t" line-end)
                 (when (monad--skip-wisp-value-on-line line-end)
                   (skip-chars-forward " \t" line-end)
-                  (when (and (< (point) line-end)
-                             (not (eq (char-after) ?\;))
-                             (not (eq (char-after) ?:)))
+                  (cond
+                   ((and (< (point) line-end)
+                         (not (eq (char-after) ?\;))
+                         (not (eq (char-after) ?:)))
                     (setq match-start (point)
-                          match-end line-end))))
+                          match-end line-end))
+                   ((>= (point) line-end)
+                    (forward-line 1)
+                    (when (and (< (point) limit)
+                               (> (current-indentation) header-indent)
+                               (not (looking-at-p "^[ \t]*$"))
+                               (not (looking-at-p "^[ \t]*;"))
+                               (not (looking-at-p "^[ \t]*:"))
+                               (not (looking-at-p "^[ \t]*\\(?:define\\|method\\|layout\\|type\\|data\\|module\\|import\\|tests\\|test\\)\\_>")))
+                      (setq match-start (save-excursion
+                                          (back-to-indentation)
+                                          (point)))
+                      (while (and (< (point) limit)
+                                  (> (current-indentation) header-indent)
+                                  (not (looking-at-p "^[ \t]*$"))
+                                  (not (looking-at-p "^[ \t]*;"))
+                                  (not (looking-at-p "^[ \t]*:"))
+                                  (not (looking-at-p "^[ \t]*\\(?:define\\|method\\|layout\\|type\\|data\\|module\\|import\\|tests\\|test\\)\\_>")))
+                        (setq match-end (min (line-end-position) limit))
+                        (forward-line 1)))))))
             (error nil)))
         (if (and match-start match-end (< match-start match-end))
             (progn
+              (put-text-property match-start match-end
+                                 'font-lock-multiline t)
               (set-match-data
                (list match-start match-end match-start match-end))
               (goto-char match-end)
@@ -1959,14 +2163,10 @@ This matcher always moves forward and does not call `up-list'."
   "Return font-lock keywords for Wisp mode."
   (append
    (list
-    ;; ╭─ right-pointing comment: color ╭─ and everything after it
-    '("\\(\u256D\u2500\\)[ \t]*\\(.*\\)$" (1 font-lock-comment-face t) (2 font-lock-comment-face t))
-    ;; ╰─ right-pointing comment: color ╰─ and everything after it
-    '("\\(\u2570\u2500\\)[ \t]*\\(.*\\)$" (1 font-lock-comment-face t) (2 font-lock-comment-face t))
-    ;; ╮ left-pointing comment: color everything before it AND the ╮ itself
-    '("^\\(.*?\\)\\([ \t]*\u256E\\)\\(?:\\s-\\|$\\)" (1 font-lock-comment-face t) (2 font-lock-comment-face t))
-    ;; ╯ left-pointing comment: color everything before it AND the ╯ itself
-    '("^\\(.*?\\)\\([ \t]*\u256F\\)\\(?:\\s-\\|$\\)" (1 font-lock-comment-face t) (2 font-lock-comment-face t))
+    '(monad-type-arrow-matcher (0 'monad-type-arrow-face t))
+    '(monad-arrow-matcher (0 'monad-arrow-face t))
+    '(monad-guard-rail-matcher (0 'monad-guard-rail-face t))
+    '(monad-box-comment-matcher (0 font-lock-comment-face t))
     '(monad-block-comment-matcher (0 (progn
                                        (put-text-property (match-beginning 0)
                                                           (match-end 0)
@@ -2051,8 +2251,7 @@ This matcher always moves forward and does not call `up-list'."
                       found))
                   (list subexp face nil t))))
              asm-keywords))
-   (when monad-highlight-arrow
-     '(("->" . font-lock-keyword-face)))))
+   nil))
 
 ;; Set up docstring detection
 (put 'lambda 'monad-doc-string-elt 2)
@@ -2193,6 +2392,14 @@ Requires the enclosing delimiter to be `(' -- bracket-enclosed symbols like
         (add-face-text-property (match-beginning 0) (match-end 0)
                                 'font-lock-builtin-face t s)
         (setq i (match-end 0))))
+
+    ;; Type arrows
+    (let ((i 0))
+      (while (string-match "->" s i)
+        (add-face-text-property (match-beginning 0) (match-end 0)
+                                'monad-type-arrow-face t s)
+        (setq i (match-end 0))))
+
     ;; Function name
     (when (string-match "^(\\([A-Za-z_][A-Za-z0-9_'!?$%&*/+<=>.^~-]*\\)" s)
       (add-face-text-property (match-beginning 1) (match-end 1)
