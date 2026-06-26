@@ -290,8 +290,9 @@ Hash table mapping name strings to the first line of their docstring,
 or nil when there is none.")
 
 (defun monad--invalidate-docstring-cache ()
-  "Clear the buffer-local docstring cache and column-alignment records."
+  "Clear buffer-local docstring, Commentary, and alignment caches."
   (setq monad--docstring-cache nil
+        monad--commentary-section-cache nil
         monad--imenu-max-name-len 0
         monad--imenu-max-type-len 0))
 
@@ -450,32 +451,39 @@ Returns the first line of the docstring, or nil."
   "^[ \t]*;;;[ \t]*Code:[^\n]*"
   "Regexp matching the top-level Code heading.")
 
+(defvar-local monad--commentary-section-cache nil
+  "Cached Commentary body bounds.
+The value is (TICK . BOUNDS), where BOUNDS is (START . END) or nil.")
+
+(defun monad--commentary-section-cache-bounds ()
+  "Return cached raw Commentary body bounds, or nil."
+  (let ((tick (buffer-chars-modified-tick)))
+    (if (and monad--commentary-section-cache
+             (= (car monad--commentary-section-cache) tick))
+        (cdr monad--commentary-section-cache)
+      (let (bounds)
+        (save-excursion
+          (goto-char (point-min))
+          (when (re-search-forward monad--commentary-heading-regexp nil t)
+            (forward-line 1)
+            (let ((body-start (point))
+                  (body-end (if (re-search-forward monad--code-heading-regexp nil t)
+                                (match-beginning 0)
+                              (point-max))))
+              (setq bounds (cons body-start body-end)))))
+        (setq monad--commentary-section-cache (cons tick bounds))
+        bounds))))
+
 (defun monad--commentary-section-boundaries (&optional pos)
   "Return the raw Commentary body bounds around POS, or nil.
 The body starts after `;;; Commentary:' and ends before `;;; Code:'.
 The Commentary heading itself is left to normal comment syntax."
-  (save-excursion
-    (goto-char (or pos (point)))
-    (let ((here (point))
-          body-start
-          body-end)
-      (beginning-of-line)
-      (cond
-       ((looking-at monad--commentary-heading-regexp)
-        (goto-char (match-end 0)))
-       ((re-search-backward monad--commentary-heading-regexp nil t)
-        (goto-char (match-end 0))))
-      (when (looking-back monad--commentary-heading-regexp
-                          (line-beginning-position))
-        (forward-line 1)
-        (setq body-start (point))
-        (setq body-end
-              (if (re-search-forward monad--code-heading-regexp nil t)
-                  (match-beginning 0)
-                (point-max)))
-        (when (and (>= here body-start)
-                   (< here body-end))
-          (cons body-start body-end))))))
+  (let* ((here (or pos (point)))
+         (bounds (monad--commentary-section-cache-bounds)))
+    (when (and bounds
+               (>= here (car bounds))
+               (< here (cdr bounds)))
+      bounds)))
 
 (defun monad-commentary-section-matcher (limit)
   "Match only the raw top-level Commentary body up to LIMIT.
@@ -544,100 +552,150 @@ Group 1 is the actual escape literal.")
             (throw 'found t))))
       nil)))
 
+(defconst monad--rx-rail-hline
+  (regexp-quote (string ?\u2500)))
+
+(defconst monad--rx-rail-open-left
+  (regexp-quote (string ?\u256D)))
+
+(defconst monad--rx-rail-close-left
+  (regexp-quote (string ?\u2570)))
+
+(defconst monad--rx-rail-open-right
+  (regexp-quote (string ?\u256E)))
+
+(defconst monad--rx-rail-close-right
+  (regexp-quote (string ?\u256F)))
+
+(defconst monad--rx-rail-tee
+  (regexp-quote (string ?\u252C)))
+
+(defconst monad--rx-rail-branch
+  (regexp-quote (string ?\u251C)))
+
+(defconst monad--rx-result-triangle
+  (regexp-quote (string ?\u25B6)))
+
+(defconst monad--rx-result-arrow
+  (concat "\\(?:->\\|" monad--rx-result-triangle "\\)"))
+
+(defconst monad--rx-rail-line-prefix
+  "\\(?:\\`\\|[ \t]\\)")
+
+(defconst monad--rx-guard-rail-open-left
+  (concat monad--rx-rail-open-left monad--rx-rail-hline "+"))
+
+(defconst monad--rx-guard-rail-open-top
+  (concat monad--rx-rail-tee monad--rx-rail-hline "+"))
+
+(defconst monad--rx-guard-rail-open-right
+  (concat monad--rx-rail-hline "+" monad--rx-rail-open-right))
+
+(defconst monad--rx-guard-rail-branch
+  (concat monad--rx-rail-branch monad--rx-rail-hline "+"))
+
+(defconst monad--rx-guard-rail-fallback
+  (concat monad--rx-rail-close-left monad--rx-rail-hline "*" monad--rx-result-arrow))
+
+(defconst monad--rx-guard-rail
+  (concat "\\(?:"
+          monad--rx-guard-rail-open-left
+          "\\|" monad--rx-guard-rail-open-top
+          "\\|" monad--rx-guard-rail-open-right
+          "\\|" monad--rx-guard-rail-branch
+          "\\|" monad--rx-guard-rail-fallback
+          "\\)"))
+
+(defconst monad--rx-box-comment
+  (concat "\\(?:"
+          "\\(" monad--rx-rail-open-left monad--rx-rail-hline
+          "\\|" monad--rx-rail-close-left monad--rx-rail-hline
+          "\\)[ \t]*\\(.*\\)$"
+          "\\|"
+          "^\\(.*?\\)\\([ \t]*\\(?:"
+          monad--rx-rail-open-right
+          "\\|" monad--rx-rail-close-right
+          "\\)\\)\\(?:\\s-\\|$\\)"
+          "\\)"))
+
+(defun monad--font-lock-match-regexp (limit regexp predicate &optional group)
+  "Match REGEXP up to LIMIT when PREDICATE accepts the match.
+GROUP defaults to 0.  PREDICATE receives BEG and END."
+  (let ((group (or group 0))
+        found)
+    (while (and (not found)
+                (re-search-forward regexp limit t))
+      (let ((beg (match-beginning group))
+            (end (match-end group))
+            (next (match-end 0)))
+        (if (and beg end
+                 (or (not predicate)
+                     (funcall predicate beg end)))
+            (progn
+              (set-match-data (list beg end beg end))
+              (goto-char end)
+              (setq found t))
+          (goto-char next))))
+    found))
+
 (defun monad--guard-rail-line-p (&optional pos)
   "Return non-nil when POS is on a Unicode guard rail line."
   (save-excursion
     (when pos
       (goto-char pos))
-    (let* ((line (buffer-substring-no-properties
-                  (line-beginning-position)
-                  (line-end-position)))
-           (h (regexp-quote (string ?\u2500)))
-           (ul (regexp-quote (string ?\u256D)))
-           (ll (regexp-quote (string ?\u2570)))
-           (ur (regexp-quote (string ?\u256E)))
-           (tee (regexp-quote (string ?\u252C)))
-           (mid (regexp-quote (string ?\u251C)))
-           (tri (regexp-quote (string ?\u25B6)))
-           (arrow (concat "\\(?:->\\|" tri "\\)"))
-           (open-left (concat ul h "+"))
-           (open-top (concat tee h "+"))
-           (open-right (concat h "+" ur))
-           (branch (concat mid h "+"))
-           (fallback (concat ll h "*" arrow)))
+    (let ((line (buffer-substring-no-properties
+                 (line-beginning-position)
+                 (line-end-position))))
       (or
        (string-match-p
-        (concat "\\(?:\\`\\|[ \t]\\)\\(?:"
-                open-left "\\|" open-top
-                "\\)[ \t]+.*" arrow)
+        (concat monad--rx-rail-line-prefix
+                "\\(?:"
+                monad--rx-guard-rail-open-left
+                "\\|"
+                monad--rx-guard-rail-open-top
+                "\\)[ \t]+.*"
+                monad--rx-result-arrow)
         line)
        (string-match-p
-        (concat "\\(?:\\`\\|[ \t]\\)" open-right "[ \t]*\\'")
+        (concat monad--rx-rail-line-prefix
+                monad--rx-guard-rail-open-right
+                "[ \t]*\\'")
         line)
        (string-match-p
-        (concat "\\(?:\\`\\|[ \t]\\)" open-right "[ \t]+.*" arrow)
+        (concat monad--rx-rail-line-prefix
+                monad--rx-guard-rail-open-right
+                "[ \t]+.*"
+                monad--rx-result-arrow)
         line)
        (string-match-p
-        (concat "\\(?:\\`\\|[ \t]\\)" branch "[ \t]+.*" arrow)
+        (concat monad--rx-rail-line-prefix
+                monad--rx-guard-rail-branch
+                "[ \t]+.*"
+                monad--rx-result-arrow)
         line)
        (string-match-p
-        (concat "\\(?:\\`\\|[ \t]\\)" fallback "[ \t]+")
+        (concat monad--rx-rail-line-prefix
+                monad--rx-guard-rail-fallback
+                "[ \t]+")
         line)))))
 
 (defun monad-guard-rail-matcher (limit)
   "Match Unicode guard rail connectors up to LIMIT."
-  (let* ((h (regexp-quote (string ?\u2500)))
-         (ul (regexp-quote (string ?\u256D)))
-         (ll (regexp-quote (string ?\u2570)))
-         (ur (regexp-quote (string ?\u256E)))
-         (tee (regexp-quote (string ?\u252C)))
-         (mid (regexp-quote (string ?\u251C)))
-         (tri (regexp-quote (string ?\u25B6)))
-         (fallback-arrow (concat "\\(?:->\\|" tri "\\)"))
-         (rail-rx
-          (concat "\\(?:"
-                  ul h "+"
-                  "\\|" tee h "+"
-                  "\\|" h "+" ur
-                  "\\|" mid h "+"
-                  "\\|" ll h "*" fallback-arrow
-                  "\\)"))
-         found)
-    (while (and (not found)
-                (re-search-forward rail-rx limit t))
-      (let ((beg (match-beginning 0))
-            (end (match-end 0)))
-        (if (and (monad--guard-rail-line-p beg)
-                 (monad--font-lock-code-position-p beg))
-            (progn
-              (set-match-data (list beg end beg end))
-              (goto-char end)
-              (setq found t))
-          (goto-char end))))
-    found))
+  (monad--font-lock-match-regexp
+   limit
+   monad--rx-guard-rail
+   (lambda (beg _end)
+     (and (monad--guard-rail-line-p beg)
+          (monad--font-lock-code-position-p beg)))))
 
 (defun monad-box-comment-matcher (limit)
   "Match decorative box comments, but never Monad guard rails."
-  (let* ((h (regexp-quote (string ?\u2500)))
-         (ul (regexp-quote (string ?\u256D)))
-         (ll (regexp-quote (string ?\u2570)))
-         (ur (regexp-quote (string ?\u256E)))
-         (lr (regexp-quote (string ?\u256F)))
-         (comment-rx
-          (concat "\\(?:"
-                  "\\(" ul h "\\|" ll h "\\)[ \t]*\\(.*\\)$"
-                  "\\|"
-                  "^\\(.*?\\)\\([ \t]*\\(?:" ur "\\|" lr "\\)\\)\\(?:\\s-\\|$\\)"
-                  "\\)"))
-         found)
-    (while (and (not found)
-                (re-search-forward comment-rx limit t))
-      (let ((beg (match-beginning 0)))
-        (if (or (monad--guard-rail-line-p beg)
-                (not (monad--font-lock-code-position-p beg)))
-            (goto-char (match-end 0))
-          (setq found t))))
-    found))
+  (monad--font-lock-match-regexp
+   limit
+   monad--rx-box-comment
+   (lambda (beg _end)
+     (and (not (monad--guard-rail-line-p beg))
+          (monad--font-lock-code-position-p beg)))))
 
 (defun monad--type-arrow-position-p (pos)
   "Return non-nil when POS is on a type signature arrow."
@@ -671,40 +729,22 @@ Group 1 is the actual escape literal.")
 (defun monad-type-arrow-matcher (limit)
   "Match Monad type signature arrows up to LIMIT."
   (when monad-highlight-arrow
-    (let (found)
-      (while (and (not found)
-                  (re-search-forward "->" limit t))
-        (let ((beg (match-beginning 0))
-              (end (match-end 0)))
-          (if (and beg end
-                   (monad--font-lock-code-position-p beg)
-                   (monad--type-arrow-position-p beg))
-              (progn
-                (set-match-data (list beg end beg end))
-                (goto-char end)
-                (setq found t))
-            (goto-char end))))
-      found)))
+    (monad--font-lock-match-regexp
+     limit
+     "->"
+     (lambda (beg _end)
+       (and (monad--font-lock-code-position-p beg)
+            (monad--type-arrow-position-p beg))))))
 
 (defun monad-arrow-matcher (limit)
   "Match Monad result arrows up to LIMIT."
   (when monad-highlight-arrow
-    (let* ((tri (regexp-quote (string ?\u25B6)))
-           (arrow-rx (concat "\\(?:->\\|" tri "\\)"))
-           found)
-      (while (and (not found)
-                  (re-search-forward arrow-rx limit t))
-        (let ((beg (match-beginning 0))
-              (end (match-end 0)))
-          (if (and beg end
-                   (monad--font-lock-code-position-p beg)
-                   (not (monad--type-arrow-position-p beg)))
-              (progn
-                (set-match-data (list beg end beg end))
-                (goto-char end)
-                (setq found t))
-            (goto-char end))))
-      found)))
+    (monad--font-lock-match-regexp
+     limit
+     monad--rx-result-arrow
+     (lambda (beg _end)
+       (and (monad--font-lock-code-position-p beg)
+            (not (monad--type-arrow-position-p beg)))))))
 
 (defun monad-error-string-matcher (limit)
   "Match an error payload after `error'.
@@ -1535,34 +1575,38 @@ and aligns '-> ' to match previous lines. Handles type signatures and guards aut
               ;; Vacuum up whitespace and a pre-existing arrow to the right.
               (monad--delete-space-and-forward-arrow)))))))))
 
-
-
+(defun monad--in-module-form-p ()
+  "Return non-nil when point is inside a module form."
+  (save-excursion
+    (catch 'found
+      (condition-case nil
+          (while t
+            (up-list -1)
+            (when (and (eq (char-after) ?\()
+                       (save-excursion
+                         (forward-char 1)
+                         (skip-chars-forward " \t\n")
+                         (looking-at "module\\b")))
+              (throw 'found t)))
+        (error nil)))))
 
 (defun monad-post-self-insert ()
-  "Handle post-insertion actions: asm fontification."
-  (when (and (monad-in-asm-form-p)
-             (eq (char-before) ?:))
-    (save-excursion
-      (let ((line-start (line-beginning-position))
-            (line-end (line-end-position)))
-        (font-lock-flush line-start line-end)
-        (font-lock-fontify-region line-start line-end))))
-  (let ((in-module
-         (save-excursion
-           (catch 'found
-             (condition-case nil
-                 (while t
-                   (up-list -1)
-                   (when (and (eq (char-after) ?\()
-                              (save-excursion
-                                (forward-char 1)
-                                (skip-chars-forward " \t\n")
-                                (looking-at "module\\b")))
-                     (throw 'found t)))
-               (error nil))))))
-    (unless in-module
-      (monad-insert-type-annotation)
-      (monad-insert-arrow-annotation))))
+  "Handle post-insertion actions."
+  (let ((char (char-before)))
+    (cond
+     ((eq char ?|)
+      (monad--expand-guard-pipe-after-self-insert))
+     ((and (eq char ?:)
+           (monad-in-asm-form-p))
+      (save-excursion
+        (let ((line-start (line-beginning-position))
+              (line-end (line-end-position)))
+          (font-lock-flush line-start line-end)
+          (font-lock-fontify-region line-start line-end))))
+     ((eq char ?\s)
+      (unless (monad--in-module-form-p)
+        (monad-insert-type-annotation)
+        (monad-insert-arrow-annotation))))))
 
 (defun monad-insert-lambda ()
   "Insert λ smartly, building λx.λy.λz... chains."
@@ -1590,6 +1634,329 @@ and aligns '-> ' to match previous lines. Handles type signatures and guards aut
    ;; Fallback: insert λ
    (t
     (insert "λ"))))
+
+(defconst monad--guard-rail-entry
+  (string ?\u252c ?\u2500)
+  "Compact guard rail entry token.")
+
+(defconst monad--guard-rail-branch
+  (string ?\u251c ?\u2500)
+  "Guard rail branch token.")
+
+(defconst monad--guard-rail-fallback
+  (string ?\u2570 ?\u2500 ?\u2500 ?\u2500 ?\u25b6)
+  "Guard rail fallback token.")
+
+(defconst monad--guard-rail-hanging
+  (string ?\u2500 ?\u256e)
+  "Hanging guard rail entry token.")
+
+(defun monad--line-blank-p ()
+  "Return non-nil when the current line is blank."
+  (save-excursion
+    (beginning-of-line)
+    (looking-at-p "^[ \t]*$")))
+
+(defun monad--line-wisp-signature-p ()
+  "Return non-nil when the current line is a Wisp define signature."
+  (save-excursion
+    (beginning-of-line)
+    (looking-at-p
+     (concat "^[ \t]*\\(?:define\\|method\\)\\s-+"
+             monad--identifier-regexp
+             "\\s-+::"))))
+
+(defun monad--inside-wisp-definition-body-p ()
+  "Return non-nil when point is in an indented Wisp definition body."
+  (let ((indent (current-indentation)))
+    (and (> indent 0)
+         (save-excursion
+           (catch 'found
+             (while (not (bobp))
+               (forward-line -1)
+               (unless (monad--line-blank-p)
+                 (let ((prev-indent (current-indentation)))
+                   (cond
+                    ((and (< prev-indent indent)
+                          (monad--line-wisp-signature-p))
+                     (throw 'found t))
+                    ((< prev-indent indent)
+                     (throw 'found nil)))))))
+             nil))))
+
+(defun monad--inside-wisp-definition-body-p ()
+  "Return non-nil when point is in an indented Wisp definition body."
+  (and (> (current-indentation) 0)
+       (save-excursion
+         (catch 'found
+           (while (not (bobp))
+             (forward-line -1)
+             (unless (monad--line-blank-p)
+               (cond
+                ((monad--line-wisp-signature-p)
+                 (throw 'found t))
+                ((and (= (current-indentation) 0)
+                      (looking-at-p
+                       "^[ \t]*\\(?:define\\|method\\|layout\\|type\\|data\\|module\\|import\\|tests\\)\\_>"))
+                 (throw 'found nil)))))
+           nil))))
+
+(defvar-local monad--guard-rail-aligning nil
+  "Non-nil while Monad guard rail indentation is being updated.")
+
+(defun monad--inside-wisp-definition-body-p ()
+  "Return non-nil when point is in an indented Wisp definition body."
+  (and (> (current-indentation) 0)
+       (save-excursion
+         (catch 'found
+           (while (not (bobp))
+             (forward-line -1)
+             (unless (monad--line-blank-p)
+               (cond
+                ((monad--line-wisp-signature-p)
+                 (throw 'found t))
+                ((and (= (current-indentation) 0)
+                      (looking-at-p
+                       "^[ \t]*\\(?:define\\|method\\|layout\\|type\\|data\\|module\\|import\\|tests\\)\\_>"))
+                 (throw 'found nil)))))
+           nil))))
+
+(defun monad--inside-square-brackets-p ()
+  "Return non-nil when point is inside square brackets."
+  (let ((open (nth 1 (syntax-ppss))))
+    (and open
+         (eq (char-after open) ?\[))))
+
+(defun monad--guard-fallback-regexp ()
+  "Return a regexp matching a Monad fallback rail."
+  (concat (regexp-quote (string ?\u2570))
+          (regexp-quote (string ?\u2500))
+          "*"
+          (regexp-quote (string ?\u25b6))))
+
+(defun monad--line-has-guard-rail-p ()
+  "Return non-nil when the current line already has a guard rail."
+  (save-excursion
+    (beginning-of-line)
+    (re-search-forward
+     (concat "\\(?:"
+             (regexp-quote monad--guard-rail-entry)
+             "\\|"
+             (regexp-quote monad--guard-rail-hanging)
+             "\\|"
+             (regexp-quote monad--guard-rail-branch)
+             "\\|"
+             (monad--guard-fallback-regexp)
+             "\\|->\\)")
+     (line-end-position)
+     t)))
+
+(defun monad--smart-guard-entry-context-p (&optional pos)
+  "Return non-nil when a pipe at POS should become a guard rail entry."
+  (save-excursion
+    (when pos
+      (goto-char pos))
+    (and (monad--font-lock-code-position-p (point))
+         (monad--inside-wisp-definition-body-p)
+         (not (monad--inside-square-brackets-p))
+         (not (monad--line-has-guard-rail-p))
+         (or (save-excursion
+               (skip-chars-forward " \t")
+               (eolp))
+             (and (eq (char-after) ?|)
+                  (save-excursion
+                    (forward-char 1)
+                    (skip-chars-forward " \t")
+                    (eolp)))))))
+
+(defun monad--insert-guard-rail-entry (token &optional trailing-space)
+  "Insert guard rail entry TOKEN at point."
+  (unless (or (bolp)
+              (member (char-before) '(?\s ?\t)))
+    (insert " "))
+  (insert token)
+  (when trailing-space
+    (insert " ")))
+
+(defun monad--expand-guard-pipe-after-self-insert ()
+  "Rewrite a just-inserted pipe into a guard rail entry when appropriate."
+  (when (and (eq last-command-event ?|)
+             (> (point) (line-beginning-position))
+             (eq (char-before) ?|)
+             (monad--smart-guard-entry-context-p (1- (point))))
+    (delete-char -1)
+    (monad--insert-guard-rail-entry monad--guard-rail-entry t)))
+
+(defun monad-pipe ()
+  "Insert a pipe, or start a compact Unicode guard rail in Wisp bodies."
+  (interactive)
+  (if (monad--smart-guard-entry-context-p)
+      (monad--insert-guard-rail-entry monad--guard-rail-entry t)
+    (insert "|")))
+
+(defun monad-hanging-pipe ()
+  "Start a hanging Unicode guard rail in Wisp bodies."
+  (interactive)
+  (if (monad--smart-guard-entry-context-p)
+      (progn
+        (monad--insert-guard-rail-entry monad--guard-rail-hanging nil)
+        (monad--insert-guard-rail-line
+         (monad--guard-rail-column-on-line)
+         monad--guard-rail-branch))
+    (insert "|")))
+
+(defun monad--guard-rail-column-on-line ()
+  "Return the visual column of the guard rail on the current line."
+  (save-excursion
+    (beginning-of-line)
+    (catch 'found
+      (dolist (token (list monad--guard-rail-entry
+                           monad--guard-rail-branch))
+        (goto-char (line-beginning-position))
+        (when (search-forward token (line-end-position) t)
+          (goto-char (match-beginning 0))
+          (throw 'found (current-column))))
+      (goto-char (line-beginning-position))
+      (when (search-forward monad--guard-rail-hanging (line-end-position) t)
+        (goto-char (1+ (match-beginning 0)))
+        (throw 'found (current-column)))
+      (goto-char (line-beginning-position))
+      (when (re-search-forward (monad--guard-fallback-regexp)
+                               (line-end-position)
+                               t)
+        (goto-char (match-beginning 0))
+        (throw 'found (current-column)))
+      nil)))
+
+(defun monad--guard-rail-entry-line-p ()
+  "Return non-nil when the current line starts a guard rail block."
+  (save-excursion
+    (beginning-of-line)
+    (or (search-forward monad--guard-rail-entry (line-end-position) t)
+        (search-forward monad--guard-rail-hanging (line-end-position) t))))
+
+(defun monad--guard-rail-branch-line-p ()
+  "Return non-nil when the current line is a guard rail branch."
+  (save-excursion
+    (back-to-indentation)
+    (or (looking-at-p (regexp-quote monad--guard-rail-branch))
+        (looking-at-p (monad--guard-fallback-regexp)))))
+
+(defun monad--guard-rail-fallback-line-p ()
+  "Return non-nil when the current line is a guard rail fallback."
+  (save-excursion
+    (back-to-indentation)
+    (looking-at-p (monad--guard-fallback-regexp))))
+
+(defun monad--guard-rail-entry-line-position ()
+  "Return the beginning of the guard rail entry line for point."
+  (save-excursion
+    (beginning-of-line)
+    (cond
+     ((monad--guard-rail-entry-line-p)
+      (line-beginning-position))
+     ((monad--guard-rail-branch-line-p)
+      (catch 'found
+        (while (not (bobp))
+          (forward-line -1)
+          (cond
+           ((monad--guard-rail-entry-line-p)
+            (throw 'found (line-beginning-position)))
+           ((monad--guard-rail-branch-line-p)
+            nil)
+           ((monad--line-blank-p)
+            nil)
+           (t
+            (throw 'found nil))))
+        nil)))))
+
+(defun monad--guard-rail-align-block-at-point (&optional pos)
+  "Align the guard rail block around POS."
+  (unless monad--guard-rail-aligning
+    (save-excursion
+      (when pos
+        (goto-char pos))
+      (let ((entry (monad--guard-rail-entry-line-position)))
+        (when entry
+          (let ((monad--guard-rail-aligning t)
+                (inhibit-modification-hooks t))
+            (with-silent-modifications
+              (goto-char entry)
+              (let ((column (monad--guard-rail-column-on-line)))
+                (when column
+                  (forward-line 1)
+                  (while (and (not (eobp))
+                              (monad--guard-rail-branch-line-p))
+                    (unless (= (current-indentation) column)
+                      (beginning-of-line)
+                      (delete-horizontal-space)
+                      (indent-to column))
+                    (forward-line 1)))))))))))
+
+(defun monad--guard-rail-align-block-near (pos)
+  "Align any guard rail block near POS."
+  (when pos
+    (let ((marker (copy-marker pos t)))
+      (unwind-protect
+          (save-excursion
+            (goto-char marker)
+            (forward-line -4)
+            (dotimes (_ 12)
+              (ignore-errors
+                (monad--guard-rail-align-block-at-point (point)))
+              (unless (eobp)
+                (forward-line 1))))
+        (set-marker marker nil)))))
+
+(defun monad--guard-rail-after-change (beg _end _len)
+  "Keep guard rail blocks aligned after edits."
+  (unless monad--guard-rail-aligning
+    (monad--guard-rail-align-block-near beg)))
+
+(defun monad--guard-rail-line-context-p ()
+  "Return non-nil when the current line is an editable guard rail line."
+  (and (monad--inside-wisp-definition-body-p)
+       (monad--guard-rail-column-on-line)
+       (not (monad--guard-rail-fallback-line-p))))
+
+(defun monad--insert-guard-rail-line (column token)
+  "Insert a new guard rail line at COLUMN with TOKEN."
+  (delete-horizontal-space)
+  (newline)
+  (indent-to column)
+  (insert token " "))
+
+(defun monad--guard-rail-ret ()
+  "Insert another guard branch when point is on a guard rail line."
+  (when (monad--guard-rail-line-context-p)
+    (let ((column (monad--guard-rail-column-on-line)))
+      (end-of-line)
+      (monad--insert-guard-rail-line column monad--guard-rail-branch)
+      t)))
+
+(defun monad-shift-ret ()
+  "Insert an otherwise-style guard rail fallback branch."
+  (interactive)
+  (if (monad--guard-rail-line-context-p)
+      (let ((column (monad--guard-rail-column-on-line)))
+        (end-of-line)
+        (monad--insert-guard-rail-line column monad--guard-rail-fallback))
+    (monad-newline)))
+
+(defun monad-open-line (arg)
+  "Open ARG lines and repair nearby guard rail alignment."
+  (interactive "p")
+  (let ((origin (copy-marker (point) t))
+        (count (or arg 1)))
+    (unwind-protect
+        (progn
+          (open-line count)
+          (monad--guard-rail-align-block-near (marker-position origin))
+          (save-excursion
+            (goto-char origin)
+            (forward-line count)
+            (monad--guard-rail-align-block-near (point))))
+      (set-marker origin nil))))
 
 (defun monad-colon ()
   "Insert a colon and auto-indent if in asm block."
@@ -2753,6 +3120,7 @@ Priority rules:
   (add-hook 'after-change-functions
             (lambda (&rest _) (monad--invalidate-docstring-cache))
             nil t)
+  (add-hook 'after-change-functions #'monad--guard-rail-after-change nil t)
   (setq-local syntax-propertize-function #'monad-syntax-propertize)
   (setq-local font-lock-extend-region-functions
               (list #'monad-font-lock-extend-region
@@ -2767,6 +3135,9 @@ Priority rules:
            . monad-syntactic-face-function)))
   (setq-local lisp-doc-string-elt-property 'monad-doc-string-elt)
   (local-set-key (kbd "M-;") #'monad-comment-dwim)
+  (local-set-key (kbd "C-o") #'monad-open-line)
+  (when (fboundp 'evil-local-set-key)
+    (evil-local-set-key 'insert (kbd "C-o") #'monad-open-line))
   (add-hook 'xref-backend-functions #'monad-xref-backend nil t)
   (add-hook 'completion-at-point-functions #'monad-completion-at-point nil t)
   (add-hook 'post-self-insert-hook #'monad-post-self-insert nil t)
@@ -3743,35 +4114,53 @@ Fully preserves undo behavior for self-insertion."
   "Return the display column of the fraction rule at RAIL."
   (save-excursion
     (goto-char rail)
-    (current-indentation)))
+    (if (eq (char-after) monad--fraction-rule-char)
+        (current-column)
+      (current-indentation))))
 
 (defun monad--fraction-context-at-point ()
   "Return fraction context at point, or nil.
 The returned plist has :rail, :col, and :field.  :field is nil when point
 is on the rule line itself."
-  (let (rail field)
-    (save-excursion
-      (beginning-of-line)
-      (cond
-       ((monad--fraction-rule-line-p)
-        (setq rail (line-beginning-position)
-              field nil))
-       ((save-excursion
-          (forward-line -1)
-          (monad--fraction-rule-line-p))
-        (forward-line -1)
-        (setq rail (line-beginning-position)
-              field 'bottom))
-       ((save-excursion
-          (forward-line 1)
-          (monad--fraction-rule-line-p))
-        (forward-line 1)
-        (setq rail (line-beginning-position)
-              field 'top))))
-    (when rail
-      (list :rail rail
-            :col (monad--fraction-rule-column-at rail)
-            :field field))))
+  (or
+   (when (and (monad--fraction-active-p)
+              (overlayp monad--fraction-overlay)
+              (overlay-buffer monad--fraction-overlay)
+              (>= (point) (overlay-start monad--fraction-overlay))
+              (<= (point) (overlay-end monad--fraction-overlay)))
+     (let* ((rail (marker-position monad--fraction-rail))
+            (rail-line (line-number-at-pos rail))
+            (here-line (line-number-at-pos (point)))
+            (field (cond
+                    ((= here-line (1- rail-line)) 'top)
+                    ((= here-line (1+ rail-line)) 'bottom)
+                    ((= here-line rail-line) nil))))
+       (list :rail rail
+             :col (monad--fraction-rule-column-at rail)
+             :field field)))
+   (let (rail field)
+     (save-excursion
+       (beginning-of-line)
+       (cond
+        ((monad--fraction-rule-line-p)
+         (setq rail (line-beginning-position)
+               field nil))
+        ((save-excursion
+           (forward-line -1)
+           (monad--fraction-rule-line-p))
+         (forward-line -1)
+         (setq rail (line-beginning-position)
+               field 'bottom))
+        ((save-excursion
+           (forward-line 1)
+           (monad--fraction-rule-line-p))
+         (forward-line 1)
+         (setq rail (line-beginning-position)
+               field 'top))))
+     (when rail
+       (list :rail rail
+             :col (monad--fraction-rule-column-at rail)
+             :field field)))))
 
 (defun monad--fraction-start-at (rail &optional field)
   "Make the fraction whose rule starts at RAIL active.
@@ -3883,6 +4272,52 @@ FIELD remembers the field point is currently editing."
     (forward-line offset)
     (move-to-column (+ col left idx) t)))
 
+(defun monad--fraction-field-bounds (field col)
+  "Return the content bounds of FIELD at display column COL."
+  (let ((offset (if (eq field 'top) -1 1)))
+    (save-excursion
+      (goto-char (marker-position monad--fraction-rail))
+      (forward-line offset)
+      (move-to-column col t)
+      (let ((raw-start (point))
+            (raw-end (line-end-position)))
+        (skip-chars-forward " \t" raw-end)
+        (let ((content-start (point)))
+          (if (= content-start raw-end)
+              (cons raw-start raw-start)
+            (goto-char raw-end)
+            (skip-chars-backward " \t" content-start)
+            (cons content-start (point))))))))
+
+(defun monad--fraction-select-field (field col)
+  "Select FIELD contents, or place point at its start when it is empty."
+  (let* ((bounds (monad--fraction-field-bounds field col))
+         (beg (car bounds))
+         (end (cdr bounds)))
+    (goto-char beg)
+    (when (< beg end)
+      (push-mark end t t))))
+
+(defun monad--fraction-one-line-text (text)
+  "Return TEXT as one trimmed line."
+  (string-trim
+   (replace-regexp-in-string "[\n\r]+" " " text)))
+
+(defun monad--fraction-insert-block-at-point (top col target-field)
+  "Insert a fraction block at point with TOP and select TARGET-FIELD."
+  (let ((width (+ 2 (max 1 (string-width top))))
+        rail)
+    (insert top
+            "\n" (make-string col ?\s)
+            (monad--fraction-rule width)
+            "\n" (make-string col ?\s))
+    (forward-line -1)
+    (move-to-column col t)
+    (setq rail (line-beginning-position))
+    (monad--fraction-start-at rail target-field)
+    (monad--fraction-render target-field 0)
+    (monad--fraction-select-field target-field col)))
+
 (defun monad--fraction-render (&optional force-field force-index)
   "Render the active fraction, preserving point as much as possible."
   (when (and (monad--fraction-active-p)
@@ -3942,13 +4377,12 @@ FIELD remembers the field point is currently editing."
       (let* ((col (monad--fraction-rule-column-at
                    (marker-position monad--fraction-rail)))
              (from (monad--fraction-current-field))
-             (top (monad--fraction-read-line -1 col))
-             (bottom (monad--fraction-read-line 1 col))
-             (index (monad--fraction-point-index
-                     from col (if (eq from 'top) top bottom)))
              (target (if (eq from 'top) 'bottom 'top)))
         (setq monad--fraction-field target)
-        (monad--fraction-render target index))
+        (monad--fraction-render target 0)
+        (setq col (monad--fraction-rule-column-at
+                   (marker-position monad--fraction-rail)))
+        (monad--fraction-select-field target col))
     (indent-for-tab-command)))
 
 (defun monad-tab ()
@@ -3958,57 +4392,96 @@ FIELD remembers the field point is currently editing."
       (monad-fraction-toggle-field)
     (indent-for-tab-command)))
 
+(defun monad--delete-pending-type-arrow-before-newline ()
+  "Delete a trailing pending type arrow before inserting a newline."
+  (let ((line-beg (line-beginning-position))
+        (line-end (line-end-position))
+        delete-beg)
+    (when (and (save-excursion
+                 (beginning-of-line)
+                 (looking-at-p
+                  (concat "^[ \t]*\\(?:define\\|method\\)\\s-+"
+                          monad--identifier-regexp
+                          "\\s-+::")))
+               (save-excursion
+                 (skip-chars-forward " \t" line-end)
+                 (= (point) line-end)))
+      (save-excursion
+        (goto-char line-end)
+        (skip-chars-backward " \t" line-beg)
+        (when (and (>= (- (point) line-beg) 2)
+                   (string= (buffer-substring-no-properties
+                             (- (point) 2)
+                             (point))
+                            "->"))
+          (goto-char (- (point) 2))
+          (skip-chars-backward " \t" line-beg)
+          (setq delete-beg (point))))
+      (when delete-beg
+        (delete-region delete-beg line-end)
+        (delete-horizontal-space)
+        t))))
+
 (defun monad-ret ()
-  "Insert a Monad newline, or jump from fraction top to bottom.
-When point is over the top field of any fraction, RET moves to the bottom
-field.  RET in the bottom field keeps normal newline behavior and exits
-the temporary editor."
+  "Insert a Monad newline.
+When point is over the top field of a fraction, move to the bottom
+field.  When point is on a guard rail line, insert a new guard branch.
+When a Wisp type signature ends with a pending arrow, remove it first."
   (interactive)
-  (if (monad--fraction-activate-at-point)
-      (if (eq (monad--fraction-current-field) 'top)
-          (progn
-            (setq monad--fraction-field 'bottom)
-            (monad--fraction-render 'bottom 0))
-        (monad-fraction-finish)
-        (monad-newline))
-    (monad-newline)))
+  (cond
+   ((monad--fraction-activate-at-point)
+    (if (eq (monad--fraction-current-field) 'top)
+        (let ((col (monad--fraction-rule-column-at
+                    (marker-position monad--fraction-rail))))
+          (setq monad--fraction-field 'bottom)
+          (monad--fraction-render 'bottom 0)
+          (monad--fraction-select-field 'bottom col))
+      (monad-fraction-finish)
+      (monad-newline)))
+   ((monad--guard-rail-ret))
+   (t
+    (monad--delete-pending-type-arrow-before-newline)
+    (monad-newline))))
 
 (defun monad-insert-fraction ()
   "Insert or activate a temporary editable Unicode fraction literal.
-The rule is automatically resized to the longest side plus one space on
-both sides.  TAB switches fields.  RET from the top field jumps to the
-bottom field."
+With an active region, use the region as the numerator.  Without a
+region, use the current line when it has text, otherwise create an empty
+fraction.  TAB switches fields and selects the destination field."
   (interactive)
-  (if (monad--fraction-activate-at-point)
-      (monad--fraction-render)
+  (cond
+   ((monad--fraction-activate-at-point)
+    (let ((col (monad--fraction-rule-column-at
+                (marker-position monad--fraction-rail)))
+          (field (monad--fraction-current-field)))
+      (monad--fraction-render field 0)
+      (monad--fraction-select-field field col)))
+   ((use-region-p)
+    (let* ((beg (region-beginning))
+           (end (region-end))
+           (top (monad--fraction-one-line-text
+                 (buffer-substring-no-properties beg end)))
+           (col (save-excursion
+                  (goto-char beg)
+                  (current-column))))
+      (delete-region beg end)
+      (goto-char beg)
+      (monad--fraction-insert-block-at-point top col 'bottom)))
+   (t
     (monad-fraction-finish)
     (let* ((line-beg (line-beginning-position))
            (line-end (line-end-position))
            (line-raw (buffer-substring-no-properties line-beg line-end))
-           (line-text (string-trim line-raw))
+           (line-text (monad--fraction-one-line-text line-raw))
            (has-top (not (string-empty-p line-text)))
-           (col (if has-top (current-indentation) (current-column)))
-           rail)
-      (if has-top
-          (progn
-            (end-of-line)
-            (insert "\n" (make-string col ?\s)
-                    (monad--fraction-rule (+ 2 (max 1 (string-width line-text))))
-                    "\n" (make-string col ?\s))
-            (forward-line -1)
-            (move-to-column col t)
-            (setq rail (line-beginning-position))
-            (monad--fraction-start-at rail 'bottom)
-            (monad--fraction-render 'bottom 0))
-        (delete-region line-beg line-end)
-        (insert (make-string col ?\s)
-                "\n" (make-string col ?\s) (monad--fraction-rule 3)
-                "\n" (make-string col ?\s))
-        (forward-line -1)
-        (move-to-column col t)
-        (setq rail (line-beginning-position))
-        (monad--fraction-start-at rail 'top)
-        (monad--fraction-render 'top 0)))))
+           (col (if has-top (current-indentation) (current-column))))
+      (delete-region line-beg line-end)
+      (goto-char line-beg)
+      (indent-to col)
+      (monad--fraction-insert-block-at-point
+       (if has-top line-text "")
+       col
+       (if has-top 'bottom 'top))))))
 
 (defun monad--guard-bar-code-position-p (pos line-depth)
   "Return non-nil when POS is a real guard bar at LINE-DEPTH."
@@ -4039,31 +4512,53 @@ bottom field."
          (and (or (not prev) (memq prev '(?\s ?\t ?\n)))
               (or (not next) (memq next '(?\s ?\t ?\n)))))))
 
+(defun monad--guard-token-end-at-point (square-depth limit)
+  "Return the end position of a guard token at point."
+  (let ((pos (point)))
+    (cond
+     ((monad--guard-bar-at-point-p square-depth)
+      (1+ pos))
+     ((and (= square-depth 0)
+           (looking-at-p (regexp-quote monad--guard-rail-entry)))
+      (+ pos (length monad--guard-rail-entry)))
+     ((and (= square-depth 0)
+           (looking-at-p (regexp-quote monad--guard-rail-branch)))
+      (+ pos (length monad--guard-rail-branch)))
+     ((and (= square-depth 0)
+           (looking-at-p (regexp-quote monad--guard-rail-hanging)))
+      (+ pos (length monad--guard-rail-hanging)))
+     ((and (= square-depth 0)
+           (looking-at-p (monad--guard-fallback-regexp)))
+      (save-excursion
+        (re-search-forward (monad--guard-fallback-regexp) limit t)
+        (point))))))
+
 (defun monad--guard-target-left-of-point ()
-  "Return the position after the nearest guard bar left of point."
+  "Return the position after the nearest guard token left of point."
   (let ((limit (point))
         (square-depth 0)
         target)
     (save-excursion
       (goto-char (line-beginning-position))
       (while (< (point) limit)
-        (let ((ch (char-after)))
+        (let ((ch (char-after))
+              token-end)
           (cond
            ((eq ch ?[)
             (setq square-depth (1+ square-depth)))
            ((eq ch ?])
             (setq square-depth (max 0 (1- square-depth))))
-           ((monad--guard-bar-at-point-p square-depth)
+           ((setq token-end (monad--guard-token-end-at-point square-depth limit))
             (setq target
                   (save-excursion
-                    (forward-char 1)
+                    (goto-char token-end)
                     (skip-chars-forward " \t" limit)
                     (point))))))
         (forward-char 1)))
     (and target (< target limit) target)))
 
 (defun monad--guard-target-right-of-point ()
-  "Return the position after the first guard bar right of point."
+  "Return the position after the first guard token right of point."
   (let ((origin (point))
         (limit (line-end-position))
         (square-depth 0)
@@ -4072,16 +4567,17 @@ bottom field."
       (goto-char (line-beginning-position))
       (while (and (< (point) limit)
                   (not target))
-        (let ((ch (char-after)))
+        (let ((ch (char-after))
+              token-end)
           (cond
            ((eq ch ?[)
             (setq square-depth (1+ square-depth)))
            ((eq ch ?])
             (setq square-depth (max 0 (1- square-depth))))
-           ((monad--guard-bar-at-point-p square-depth)
+           ((setq token-end (monad--guard-token-end-at-point square-depth limit))
             (let ((candidate
                    (save-excursion
-                     (forward-char 1)
+                     (goto-char token-end)
                      (skip-chars-forward " \t" limit)
                      (point))))
               (when (> candidate origin)
@@ -4116,7 +4612,11 @@ bottom field."
   :parent lisp-mode-shared-map
   "C-a" #'monad-beginning-of-line
   "C-e" #'monad-end-of-line
+  "C-o" #'monad-open-line
   "RET" #'monad-ret
+  "S-<return>" #'monad-shift-ret
+  "|" #'monad-pipe
+  "M-|" #'monad-hanging-pipe
   "TAB" #'monad-tab
   "<tab>" #'monad-tab
   "DEL" #'monad-backward-delete-char-untabify
@@ -4134,6 +4634,8 @@ bottom field."
   "M-," #'monad-xref-go-back
   "M-;" #'monad-comment-dwim
   "C-x /" monad-unicode-map)
+
+(define-key monad-mode-map [remap open-line] #'monad-open-line)
 
 ;;;###autoload
 (define-derived-mode monad-mode prog-mode "Monad"
