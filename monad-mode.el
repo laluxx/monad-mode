@@ -108,12 +108,37 @@
   :type 'boolean
   :group 'monad)
 
+(defcustom monad-highlight-path-literals t
+  "If non-nil, highlight Monad path literals."
+  :type 'boolean
+  :group 'monad)
+
+(defcustom monad-highlight-escape-literals t
+  "If non-nil, highlight Monad escape literals."
+  :type 'boolean
+  :group 'monad)
+
+(defcustom monad-highlight-layout-field-docstrings t
+  "If non-nil, highlight unquoted layout field docstrings."
+  :type 'boolean
+  :group 'monad)
+
+(defface monad-path-literal-face
+  '((t :inherit font-lock-constant-face))
+  "Face for Monad path literals."
+  :group 'monad)
+
+(defface monad-escape-literal-face
+  '((t :inherit font-lock-string-face))
+  "Face for Monad escape literals."
+  :group 'monad)
+
 (defface monad-underscore-face
   '((t :inherit shadow))
   "Face for underscore wildcard pattern."
   :group 'monad)
 
-(defface monad-infix-face
+(defface monad-doc-code-face
   '((t :inherit font-lock-variable-name-face))
   "Face for infix backtick expressions like `fun`."
   :group 'monad)
@@ -170,7 +195,7 @@
 (define-abbrev-table 'monad-mode-abbrev-table ())
 
 (defconst monad-keywords
-  '("define" "method" "variable" "def" "lambda" "match" "with" "layout" "type" "data" "deriving"
+  '("define" "infer" "method" "variable" "def" "lambda" "match" "with" "layout" "type" "data" "deriving"
     "let" "letrec" "let*" "cond" "case" "if" "then" "else"
     "and" "or" "not" "quote" "unquote" "quasiquote"
     "begin" "when" "unless" "error" "instance" "asm"
@@ -401,6 +426,225 @@ Returns the first line of the docstring, or nil."
     (while (re-search-forward "'\\(\\\\.[^']*\\|.\\)'" limit t)
       (throw 'found t))
     nil))
+
+(defconst monad--commentary-heading-regexp
+  "^[ \t]*;;;[ \t]*Commentary:[^\n]*"
+  "Regexp matching the top-level Commentary heading.")
+
+(defconst monad--code-heading-regexp
+  "^[ \t]*;;;[ \t]*Code:[^\n]*"
+  "Regexp matching the top-level Code heading.")
+
+(defun monad--commentary-section-boundaries (&optional pos)
+  "Return the raw Commentary body bounds around POS, or nil.
+The body starts after `;;; Commentary:' and ends before `;;; Code:'.
+The Commentary heading itself is left to normal comment syntax."
+  (save-excursion
+    (goto-char (or pos (point)))
+    (let ((here (point))
+          body-start
+          body-end)
+      (beginning-of-line)
+      (cond
+       ((looking-at monad--commentary-heading-regexp)
+        (goto-char (match-end 0)))
+       ((re-search-backward monad--commentary-heading-regexp nil t)
+        (goto-char (match-end 0))))
+      (when (looking-back monad--commentary-heading-regexp
+                          (line-beginning-position))
+        (forward-line 1)
+        (setq body-start (point))
+        (setq body-end
+              (if (re-search-forward monad--code-heading-regexp nil t)
+                  (match-beginning 0)
+                (point-max)))
+        (when (and (>= here body-start)
+                   (< here body-end))
+          (cons body-start body-end))))))
+
+(defun monad-commentary-section-matcher (limit)
+  "Match only the raw top-level Commentary body up to LIMIT.
+The `;;; Commentary:' heading is not part of this match."
+  (let (found)
+    (while (and (not found)
+                (< (point) limit))
+      (let ((bounds (monad--commentary-section-boundaries (point))))
+        (cond
+         (bounds
+          (let ((start (max (point) (car bounds)))
+                (end (min limit (cdr bounds))))
+            (if (< start end)
+                (progn
+                  (put-text-property start end 'font-lock-multiline t)
+                  (set-match-data (list start end start end))
+                  (goto-char end)
+                  (setq found t))
+              (goto-char limit))))
+         ((re-search-forward monad--commentary-heading-regexp limit t)
+          (forward-line 1))
+         (t
+          (goto-char limit)))))
+    found))
+
+(defun monad--font-lock-code-position-p (pos)
+  "Return non-nil when POS is not inside a string, comment, or Commentary block."
+  (let ((state (syntax-ppss pos)))
+    (and (not (or (nth 3 state)
+                  (nth 4 state)))
+         (not (monad--commentary-section-boundaries pos)))))
+
+(defconst monad-path-literal-regexp
+  "\\(?:\\`\\|[[:space:]([{]\\)\\(\\(?:~/?\\|\\.\\.?/\\|/\\)[^][(){}\"'\n\t ]+\\)"
+  "Regexp matching Monad path literals.
+Group 1 is the actual path literal.")
+
+(defconst monad-escape-literal-regexp
+  "\\(?:\\`\\|[[:space:]([{]\\)\\(\\\\\\(?:e\\|E\\|x[[:xdigit:]][[:xdigit:]]\\|[0-7][0-7]?[0-7]?\\)[^][(){}\"'\n\t ]*\\)"
+  "Regexp matching Monad escape literals.
+Group 1 is the actual escape literal.")
+
+(defun monad-path-literal-matcher (limit)
+  "Match Monad path literals up to LIMIT."
+  (when monad-highlight-path-literals
+    (catch 'found
+      (while (re-search-forward monad-path-literal-regexp limit t)
+        (let ((beg (match-beginning 1))
+              (end (match-end 1)))
+          (when (and beg end
+                     (monad--font-lock-code-position-p beg))
+            (set-match-data (list beg end beg end))
+            (throw 'found t))))
+      nil)))
+
+(defun monad-escape-literal-matcher (limit)
+  "Match Monad escape literals up to LIMIT."
+  (when monad-highlight-escape-literals
+    (catch 'found
+      (while (re-search-forward monad-escape-literal-regexp limit t)
+        (let ((beg (match-beginning 1))
+              (end (match-end 1)))
+          (when (and beg end
+                     (monad--font-lock-code-position-p beg))
+            (set-match-data (list beg end beg end))
+            (throw 'found t))))
+      nil)))
+
+(defun monad-error-string-matcher (limit)
+  "Match an error payload after `error'.
+Quoted and bare payloads split PREFIX: from the message when a colon is
+present.  The prefix uses the default face and the message uses the
+error face."
+  (let (found)
+    (while (and (not found)
+                (re-search-forward "\\_<error\\_>" limit t))
+      (let ((line-end (min (line-end-position) limit))
+            payload-start
+            payload-end
+            string-start
+            string-end
+            prefix-start
+            prefix-end
+            message-start
+            message-end)
+        (save-excursion
+          (skip-chars-forward " \t" line-end)
+          (setq payload-start (point)
+                payload-end line-end)
+          (cond
+           ((eq (char-after) ?\")
+            (setq string-start (point))
+            (condition-case nil
+                (progn
+                  (forward-sexp 1)
+                  (when (<= (point) line-end)
+                    (setq string-end (point))))
+              (error nil))
+            (when string-end
+              (goto-char (1+ string-start))
+              (if (search-forward ":" (1- string-end) t)
+                  (setq prefix-start string-start
+                        prefix-end (point)
+                        message-start (point)
+                        message-end string-end)
+                (setq prefix-start string-start
+                      prefix-end string-start
+                      message-start string-start
+                      message-end string-end))))
+           ((< payload-start payload-end)
+            (setq string-start payload-start
+                  string-end payload-end)
+            (goto-char payload-start)
+            (if (search-forward ":" payload-end t)
+                (setq prefix-start payload-start
+                      prefix-end (point)
+                      message-start (point)
+                      message-end payload-end)
+              (setq prefix-start payload-start
+                    prefix-end payload-start
+                    message-start payload-start
+                    message-end payload-end)))))
+        (if (and string-start
+                 string-end
+                 prefix-start
+                 prefix-end
+                 message-start
+                 message-end
+                 (< message-start message-end))
+            (progn
+              (set-match-data
+               (list string-start string-end
+                     prefix-start prefix-end
+                     message-start message-end))
+              (goto-char string-end)
+              (setq found t))
+          (goto-char line-end))))
+    found))
+
+(defun monad-error-delimited-text-matcher (limit)
+  "Match bracketed text inside an error payload up to LIMIT.
+This only applies to text to the right of `error' on the same line, so
+normal Monad code inside (), [], and {} keeps its usual highlighting."
+  (let (found)
+    (while (and (not found)
+                (re-search-forward
+                 "\\(?:{[^{}\n]*}\\|\\[[^][\n]*\\]\\|([^()\n]*)\\)"
+                 limit t))
+      (let ((match-start (match-beginning 0))
+            (match-end (match-end 0)))
+        (when (save-excursion
+                (goto-char (line-beginning-position))
+                (re-search-forward "\\_<error\\_>" match-start t))
+          (set-match-data
+           (list match-start match-end
+                 match-start match-end))
+          (goto-char match-end)
+          (setq found t))))
+    found))
+
+(defun monad-test-string-matcher (limit)
+  "Match the final string label on an indented assert line."
+  (let (found)
+    (while (and (not found)
+                (re-search-forward
+                 "^[ \t]+assert-\\(?:\\sw\\|\\s_\\)+\\_>"
+                 limit t))
+      (let ((line-end (min (line-end-position) limit))
+            match-start
+            match-end)
+        (save-excursion
+          (while (re-search-forward
+                  "\"\\(?:[^\"\\]\\|\\\\.\\)*\""
+                  line-end t)
+            (setq match-start (match-beginning 0)
+                  match-end (match-end 0))))
+        (if (and match-start match-end (< match-start match-end))
+            (progn
+              (set-match-data
+               (list match-start match-end match-start match-end))
+              (goto-char match-end)
+              (setq found t))
+          (goto-char line-end))))
+    found))
 
 ;;; Infix backtick support
 
@@ -1319,6 +1563,68 @@ and aligns '-> ' to match previous lines. Handles type signatures and guards aut
           (goto-char (min line-end limit)))))
     found))
 
+(defun monad--skip-wisp-value-on-line (line-end)
+  "Skip one Wisp value before LINE-END.
+Return non-nil when the value is complete.
+
+This handles normal Emacs sexps and Monad quoted list literals of the form
+`⌜ ... ⌝'.  When a `⌜' has no matching `⌝' before LINE-END, move to
+LINE-END and return nil so trailing text is not treated as a docstring yet."
+  (skip-chars-forward " \t" line-end)
+  (cond
+   ((>= (point) line-end)
+    nil)
+   ((eq (char-after) ?⌜)
+    (forward-char 1)
+    (if (search-forward "⌝" line-end t)
+        t
+      (goto-char line-end)
+      nil))
+   (t
+    (condition-case nil
+        (progn
+          (forward-sexp 1)
+          (when (> (point) line-end)
+            (goto-char line-end))
+          t)
+      (error
+       (goto-char line-end)
+       nil)))))
+
+(defun monad-wisp-typed-value-docstring-matcher (limit)
+  "Match same-line docs after Wisp typed value defines up to LIMIT."
+  (let (found)
+    (while (and (not found)
+                (re-search-forward
+                 "^[ \t]*\\(?:([ \t]*\\)?\\(?:define\\|method\\)\\s-+\\["
+                 limit t))
+      (let ((line-end (line-end-position))
+            (match-start nil)
+            (match-end nil))
+        (save-excursion
+          (goto-char (match-end 0))
+          (condition-case nil
+              (progn
+                (backward-char 1)
+                (forward-sexp 1)
+                (skip-chars-forward " \t" line-end)
+                (when (monad--skip-wisp-value-on-line line-end)
+                  (skip-chars-forward " \t" line-end)
+                  (when (and (< (point) line-end)
+                             (not (eq (char-after) ?\;))
+                             (not (eq (char-after) ?:)))
+                    (setq match-start (point)
+                          match-end line-end))))
+            (error nil)))
+        (if (and match-start match-end (< match-start match-end))
+            (progn
+              (set-match-data
+               (list match-start match-end match-start match-end))
+              (goto-char match-end)
+              (setq found t))
+          (goto-char line-end))))
+    found))
+
 (defun monad-refinement-type-docstring-matcher (limit)
   "Match indented docstrings following refinement type bodies up to LIMIT."
   (let (found)
@@ -1348,18 +1654,332 @@ and aligns '-> ' to match previous lines. Handles type signatures and guards aut
               (error nil))))))
     found))
 
+(defconst monad--layout-field-regexp
+  "\\[[^][\n]*::[^][\n]*\\]"
+  "Regexp matching one layout field form on a single line.")
+
+(defun monad--layout-header-line-p ()
+  "Return non-nil when the current line starts a layout form."
+  (save-excursion
+    (save-match-data
+      (beginning-of-line)
+      (looking-at-p "^[ \t]*\\(?:([ \t]*\\)?layout\\_>"))))
+
+(defun monad--layout-line-in-layout-p ()
+  "Return non-nil when the current line belongs to a layout.
+This is deliberately indentation based and cheap for font-lock."
+  (save-match-data
+    (or
+     (monad--layout-header-line-p)
+     (save-excursion
+       (let ((origin-indent (current-indentation))
+             (done nil)
+             (ok nil))
+         (when (> origin-indent 0)
+           (while (and (not done) (not (bobp)))
+             (forward-line -1)
+             (cond
+              ((monad--layout-header-line-p)
+               (setq ok (< (current-indentation) origin-indent)
+                     done t))
+              ((and (= (current-indentation) 0)
+                    (not (looking-at-p "^[ \t]*$")))
+               (setq done t))
+              ((and (< (current-indentation) origin-indent)
+                    (not (looking-at-p "^[ \t]*$")))
+               (setq done t)))))
+         ok)))))
+
+(defun monad--layout-real-field-start-on-line (line-end)
+  "Return the start of the next real layout field before LINE-END."
+  (save-excursion
+    (let ((found nil))
+      (while (and (not found)
+                  (re-search-forward monad--layout-field-regexp line-end t))
+        (setq found (match-beginning 0)))
+      found)))
+
+(defun monad--layout-field-doc-end (field-end line-end)
+  "Return the doc end after FIELD-END, stopping before the next field."
+  (save-excursion
+    (goto-char field-end)
+    (or (monad--layout-real-field-start-on-line line-end)
+        line-end)))
+
+(defun monad--layout-match-field-doc-on-line (line-end)
+  "Match one layout field docstring on the current line before LINE-END."
+  (let ((matched nil))
+    (while (and (not matched)
+                (re-search-forward monad--layout-field-regexp line-end t))
+      (let* ((field-end (match-end 0))
+             (doc-end (monad--layout-field-doc-end field-end line-end))
+             doc-start)
+        (goto-char field-end)
+        (skip-chars-forward " \t" doc-end)
+        (setq doc-start (point))
+        (cond
+         ((>= doc-start doc-end)
+          (goto-char field-end))
+         ((eq (char-after doc-start) ?:)
+          (goto-char field-end))
+         (t
+          (put-text-property doc-start doc-end
+                             'monad-layout-field-docstring t)
+          (set-match-data (list doc-start doc-end doc-start doc-end))
+          (goto-char doc-end)
+          (setq matched t)))))
+    matched))
+
+(defun monad--layout-skip-balanced-token-on-line (line-end)
+  "Skip one balanced bracket token before LINE-END."
+  (when (and (< (point) line-end)
+             (memq (char-after) '(?\( ?\[ ?\{)))
+    (condition-case nil
+        (let ((before (point)))
+          (forward-sexp 1)
+          (when (> (point) line-end)
+            (goto-char line-end))
+          (> (point) before))
+      (error
+       (skip-chars-forward "^ \t([{]" line-end)
+       t))))
+
+(defun monad--layout-skip-token-on-line (line-end)
+  "Skip one layout metadata token before LINE-END.
+This is delimiter-aware: v[x y] is skipped as v plus the whole [x y],
+not as v[x followed by leaked doc text."
+  (skip-chars-forward " \t" line-end)
+  (cond
+   ((>= (point) line-end)
+    nil)
+   ((monad--layout-skip-balanced-token-on-line line-end)
+    t)
+   (t
+    (let ((before (point)))
+      (skip-chars-forward "^ \t([{]" line-end)
+      (while (and (< (point) line-end)
+                  (monad--layout-skip-balanced-token-on-line line-end)))
+      (> (point) before)))))
+
+(defun monad--layout-skip-metadata-tail-on-line (line-end)
+  "Skip bracket/list tail tokens belonging to one metadata payload."
+  (skip-chars-forward " \t" line-end)
+  (while (and (< (point) line-end)
+              (memq (char-after) '(?\[ ?\( ?\{))
+              (not (looking-at-p monad--layout-field-regexp)))
+    (monad--layout-skip-token-on-line line-end)
+    (skip-chars-forward " \t" line-end)))
+
+(defun monad--layout-skip-metadata-on-line (line-end)
+  "Skip leading :metadata payloads before a layout docstring."
+  (skip-chars-forward " \t" line-end)
+  (while (and (< (point) line-end)
+              (eq (char-after) ?:))
+    (monad--layout-skip-token-on-line line-end)
+    (skip-chars-forward " \t" line-end)
+    (when (and (< (point) line-end)
+               (not (eq (char-after) ?:))
+               (not (eq (char-after) ?\[))
+               (not (eq (char-after) ?\;))
+               (not (looking-at-p monad--layout-field-regexp)))
+      (monad--layout-skip-token-on-line line-end)
+      (monad--layout-skip-metadata-tail-on-line line-end))
+    (skip-chars-forward " \t" line-end)))
+
+(defun monad--layout-header-doc-start (line-end)
+  "Return the start of an inline layout header docstring, or nil."
+  (save-excursion
+    (beginning-of-line)
+    (skip-chars-forward " \t" line-end)
+    (when (looking-at "\\(?:([ \t]*\\)?layout\\_>")
+      (goto-char (match-end 0))
+      (skip-chars-forward " \t" line-end)
+      (condition-case nil
+          (forward-sexp 1)
+        (error
+         (goto-char line-end)))
+      (skip-chars-forward " \t" line-end)
+      (monad--layout-skip-metadata-on-line line-end)
+      (let ((doc-start (point)))
+        (unless (or (>= doc-start line-end)
+                    (eq (char-after doc-start) ?\[)
+                    (eq (char-after doc-start) ?:)
+                    (eq (char-after doc-start) ?\;))
+          doc-start)))))
+
+(defun monad--layout-doc-end-on-line (doc-start line-end)
+  "Return the end of a layout docstring starting at DOC-START."
+  (save-excursion
+    (goto-char doc-start)
+    (let ((field-start (monad--layout-real-field-start-on-line line-end)))
+      (goto-char (or field-start line-end))
+      (skip-chars-backward " \t" doc-start)
+      (point))))
+
+(defun monad--layout-match-block-doc-on-line (line-end)
+  "Match one whole-layout docstring line before LINE-END."
+  (let* ((header-doc-start (monad--layout-header-doc-start line-end))
+         (doc-start nil)
+         (doc-end nil))
+    (beginning-of-line)
+    (skip-chars-forward " \t" line-end)
+    (setq doc-start (or header-doc-start (point)))
+    (goto-char doc-start)
+    (setq doc-end (monad--layout-doc-end-on-line doc-start line-end))
+    (cond
+     ((>= doc-start doc-end)
+      nil)
+     ((and (not header-doc-start)
+           (looking-at-p "\\(?:([ \t]*\\)?layout\\_>"))
+      nil)
+     ((eq (char-after doc-start) ?\[)
+      nil)
+     ((eq (char-after doc-start) ?:)
+      nil)
+     ((eq (char-after doc-start) ?\;)
+      nil)
+     (t
+      (put-text-property doc-start doc-end
+                         'monad-layout-docstring t)
+      (set-match-data (list doc-start doc-end doc-start doc-end))
+      (goto-char doc-end)
+      t))))
+
+(defun monad-layout-docstring-matcher (limit)
+  "Match layout field and whole-layout docstrings up to LIMIT.
+Inside a layout, text after a field closing bracket is a field docstring.
+Indented non-field, non-metadata text lines are whole-layout docstrings.
+This matcher always moves forward and does not call `up-list'."
+  (when monad-highlight-layout-field-docstrings
+    (let ((matched nil))
+      (while (and (not matched) (< (point) limit))
+        (let* ((scan-start (point))
+               (line-start (line-beginning-position))
+               (line-end (min (line-end-position) limit))
+               (content-start
+                (save-excursion
+                  (beginning-of-line)
+                  (skip-chars-forward " \t" line-end)
+                  (point))))
+          (cond
+           ((>= scan-start line-end)
+            (forward-line 1))
+           ((not (monad--layout-line-in-layout-p))
+            (forward-line 1))
+           ((monad--layout-match-field-doc-on-line line-end)
+            (setq matched t))
+           ((or (monad--layout-header-line-p)
+                (<= scan-start content-start))
+            (goto-char line-start)
+            (if (monad--layout-match-block-doc-on-line line-end)
+                (setq matched t)
+              (goto-char line-start)
+              (forward-line 1)))
+           (t
+            (goto-char line-start)
+            (forward-line 1)))))
+      matched)))
+
+(defconst monad-metadata-keyword-regexp
+  ":\\(?:\\sw\\|\\s_\\)+"
+  "Regexp matching Monad metadata keywords like :doc and :alias.")
+
+(defun monad-metadata-keyword-matcher (limit)
+  "Match Monad metadata keywords up to LIMIT."
+  (catch 'found
+    (while (re-search-forward monad-metadata-keyword-regexp limit t)
+      (let ((beg (match-beginning 0))
+            (end (match-end 0)))
+        (when (monad--font-lock-code-position-p beg)
+          (set-match-data (list beg end beg end))
+          (throw 'found t))))
+    nil))
+
+(defun monad-alias-value-matcher (limit)
+  "Match the value after :alias up to LIMIT."
+  (catch 'found
+    (while (re-search-forward ":alias\\_>" limit t)
+      (let ((line-end (min (line-end-position) limit))
+            alias-start
+            alias-end)
+        (if (not (monad--font-lock-code-position-p (match-beginning 0)))
+            (goto-char line-end)
+          (skip-chars-forward " \t" line-end)
+          (setq alias-start (point))
+          (unless (or (>= alias-start line-end)
+                      (eq (char-after alias-start) ?:)
+                      (eq (char-after alias-start) ?\;))
+            (skip-chars-forward "^ \t\n;" line-end)
+            (setq alias-end (point)))
+          (if (and alias-start alias-end (< alias-start alias-end))
+              (progn
+                (set-match-data (list alias-start alias-end alias-start alias-end))
+                (goto-char alias-end)
+                (throw 'found t))
+            (goto-char line-end)))))
+    nil))
+
+(defun monad-doc-metadata-payload-matcher (limit)
+  "Match :doc metadata and its payload up to LIMIT."
+  (let (found)
+    (while (and (not found)
+                (re-search-forward ":doc\\_>" limit t))
+      (let ((doc-keyword-start (match-beginning 0))
+            (doc-keyword-end (match-end 0))
+            (line-end (min (line-end-position) limit))
+            doc-start
+            doc-end)
+        (if (not (monad--font-lock-code-position-p doc-keyword-start))
+            (goto-char line-end)
+          (skip-chars-forward " \t" line-end)
+          (cond
+           ((eq (char-after) ?\")
+            (setq doc-start (point))
+            (condition-case nil
+                (progn
+                  (forward-sexp 1)
+                  (when (<= (point) limit)
+                    (setq doc-end (point))))
+              (error nil)))
+           ((< (point) line-end)
+            (setq doc-start (point)
+                  doc-end line-end)))
+          (if (and doc-start doc-end (< doc-start doc-end))
+              (progn
+                (set-match-data
+                 (list doc-keyword-start doc-end
+                       doc-keyword-start doc-keyword-end
+                       doc-start doc-end))
+                (goto-char doc-end)
+                (setq found t))
+            (goto-char line-end)))))
+    found))
+
 (defun monad-font-lock-keywords ()
   "Return font-lock keywords for Wisp mode."
   (append
    (list
+    ;; ╭─ right-pointing comment: color ╭─ and everything after it
+    '("\\(\u256D\u2500\\)[ \t]*\\(.*\\)$" (1 font-lock-comment-face t) (2 font-lock-comment-face t))
+    ;; ╰─ right-pointing comment: color ╰─ and everything after it
+    '("\\(\u2570\u2500\\)[ \t]*\\(.*\\)$" (1 font-lock-comment-face t) (2 font-lock-comment-face t))
+    ;; ╮ left-pointing comment: color everything before it AND the ╮ itself
+    '("^\\(.*?\\)\\([ \t]*\u256E\\)\\(?:\\s-\\|$\\)" (1 font-lock-comment-face t) (2 font-lock-comment-face t))
+    ;; ╯ left-pointing comment: color everything before it AND the ╯ itself
+    '("^\\(.*?\\)\\([ \t]*\u256F\\)\\(?:\\s-\\|$\\)" (1 font-lock-comment-face t) (2 font-lock-comment-face t))
     '(monad-block-comment-matcher (0 (progn
                                        (put-text-property (match-beginning 0)
                                                           (match-end 0)
                                                           'font-lock-multiline t)
                                        font-lock-comment-face)
                                    t))
+    '(monad-commentary-section-matcher (0 font-lock-comment-face t))
     '("^[ \t]*define[ \t]+[^ \t\n|]+[ \t]+[^ \t\n|]+[ \t]*\\(|.*\\)$" (1 font-lock-comment-face t))
+    '(monad-wisp-typed-value-docstring-matcher (0 font-lock-doc-face t))
     '(monad-refinement-type-docstring-matcher (0 font-lock-doc-face t))
+    '(monad-layout-docstring-matcher (0 font-lock-doc-face t))
+    '(monad-path-literal-matcher (0 'monad-path-literal-face t))
+    '(monad-escape-literal-matcher (0 'monad-escape-literal-face t))
     '("\\<include\\s-+\\(<[^>\n]+>\\)"
       (1 font-lock-string-face t))
 
@@ -1377,10 +1997,18 @@ and aligns '-> ' to match previous lines. Handles type signatures and guards aut
     (cons (regexp-opt (remove "asm" monad-keywords) 'symbols)
           'font-lock-keyword-face)
     '("::" . font-lock-builtin-face)
-    '(":\\sw+" . font-lock-builtin-face)
-    ;; :doc "string" — highlight docstrings anywhere, overriding default string face
-    '(":doc[ \t\n]+\\(\"\\(?:[^\"\\]\\|\\\\.\\)*\"\\)"
-      (1 font-lock-doc-face t))
+    '(":\\(?:\\sw\\|\\s_\\)+"
+      (0 font-lock-builtin-face))
+    '("\\(:doc\\_>\\)[ \t\n]+\\(\"\\(?:[^\"\\]\\|\\\\.\\)*\"\\)"
+      (1 font-lock-builtin-face t)
+      (2 font-lock-doc-face t))
+    '(monad-error-string-matcher
+      (1 'default t)
+      (2 'error t))
+    '(monad-error-delimited-text-matcher
+      (0 'default t))
+    '(monad-test-string-matcher
+      (0 font-lock-doc-face t))
     '(monad-char-literal-matcher . font-lock-string-face)
     '("\\<_\\>" . 'shadow)
     '("#\\+\\>" . 'shadow)
@@ -2865,16 +3493,432 @@ Fully preserves undo behavior for self-insertion."
                   (lambda ()
                     (add-hook 'post-command-hook #'monad--matrix-post-command nil t))))
 
+;;; Fraction literal editor
+
+(defconst monad--fraction-rule-char #x2500
+  "Character used for Monad fraction rules.")
+
+(defvar-local monad--fraction-rail nil
+  "Marker at the start of the active fraction rule line.")
+
+(defvar-local monad--fraction-overlay nil
+  "Overlay covering the active fraction editor.")
+
+(defvar-local monad--fraction-field 'top
+  "Current active fraction field.  Either `top' or `bottom'.")
+
+(defvar-local monad--fraction-updating nil
+  "Non-nil while the active fraction editor is rerendering.")
+
+(defun monad--fraction-active-p ()
+  "Return non-nil when there is an active fraction editor."
+  (and (markerp monad--fraction-rail)
+       (marker-buffer monad--fraction-rail)))
+
+(defun monad--fraction-rule (width)
+  "Return a fraction rule string of WIDTH rule characters."
+  (make-string (max 1 width) monad--fraction-rule-char))
+
+(defun monad--fraction-rule-line-p ()
+  "Return non-nil when the current line is a fraction rule line."
+  (save-excursion
+    (beginning-of-line)
+    (skip-chars-forward " \t")
+    (let ((start (point)))
+      (while (eq (char-after) monad--fraction-rule-char)
+        (forward-char 1))
+      (and (> (point) start)
+           (progn
+             (skip-chars-forward " \t")
+             (eolp))))))
+
+(defun monad--fraction-rule-column-at (rail)
+  "Return the display column of the fraction rule at RAIL."
+  (save-excursion
+    (goto-char rail)
+    (current-indentation)))
+
+(defun monad--fraction-context-at-point ()
+  "Return fraction context at point, or nil.
+The returned plist has :rail, :col, and :field.  :field is nil when point
+is on the rule line itself."
+  (let (rail field)
+    (save-excursion
+      (beginning-of-line)
+      (cond
+       ((monad--fraction-rule-line-p)
+        (setq rail (line-beginning-position)
+              field nil))
+       ((save-excursion
+          (forward-line -1)
+          (monad--fraction-rule-line-p))
+        (forward-line -1)
+        (setq rail (line-beginning-position)
+              field 'bottom))
+       ((save-excursion
+          (forward-line 1)
+          (monad--fraction-rule-line-p))
+        (forward-line 1)
+        (setq rail (line-beginning-position)
+              field 'top))))
+    (when rail
+      (list :rail rail
+            :col (monad--fraction-rule-column-at rail)
+            :field field))))
+
+(defun monad--fraction-start-at (rail &optional field)
+  "Make the fraction whose rule starts at RAIL active.
+FIELD remembers the field point is currently editing."
+  (monad-fraction-finish)
+  (setq monad--fraction-rail (copy-marker rail nil)
+        monad--fraction-field (or field 'top))
+  (monad--fraction-update-overlay)
+  (add-hook 'post-command-hook #'monad--fraction-post-command nil t)
+  t)
+
+(defun monad--fraction-activate-at-point ()
+  "Activate the fraction under point, if point is over one."
+  (let* ((ctx (monad--fraction-context-at-point))
+         (rail (plist-get ctx :rail))
+         (field (plist-get ctx :field)))
+    (when ctx
+      (if (and (monad--fraction-active-p)
+               (= (marker-position monad--fraction-rail) rail))
+          (progn
+            (when field
+              (setq monad--fraction-field field))
+            (monad--fraction-update-overlay))
+        (monad--fraction-start-at rail field))
+      t)))
+
+(defun monad--fraction-center (text width)
+  "Return TEXT centered inside WIDTH display columns."
+  (let* ((text-width (string-width text))
+         (pad (max 0 (- width text-width)))
+         (left (/ pad 2))
+         (right (- pad left)))
+    (concat (make-string left ?\s)
+            text
+            (make-string right ?\s))))
+
+(defun monad--fraction-line-start (offset)
+  "Return the start position of fraction line OFFSET from the rule line."
+  (save-excursion
+    (goto-char (marker-position monad--fraction-rail))
+    (forward-line offset)
+    (line-beginning-position)))
+
+(defun monad--fraction-read-line (offset col)
+  "Read and trim the fraction line OFFSET starting at display column COL."
+  (save-excursion
+    (goto-char (monad--fraction-line-start offset))
+    (move-to-column col t)
+    (string-trim
+     (buffer-substring-no-properties (point) (line-end-position)))))
+
+(defun monad--fraction-current-field ()
+  "Return the fraction field containing point, or the remembered field."
+  (let* ((ctx (monad--fraction-context-at-point))
+         (field (plist-get ctx :field)))
+    (or field monad--fraction-field 'top)))
+
+(defun monad--fraction-point-index (field col text)
+  "Return point index inside FIELD content at display column COL."
+  (if (not (eq field (monad--fraction-current-field)))
+      (length text)
+    (save-excursion
+      (let ((target (point)))
+        (goto-char (marker-position monad--fraction-rail))
+        (forward-line (if (eq field 'top) -1 1))
+        (move-to-column col t)
+        (let* ((start (point))
+               (raw (buffer-substring-no-properties start (line-end-position)))
+               (lead (if (string-match "\\`[ \t]*" raw)
+                         (match-end 0)
+                       0))
+               (idx (- target start lead)))
+          (max 0 (min (length text) idx)))))))
+
+(defun monad--fraction-replace-tail (offset col text)
+  "Replace fraction line OFFSET from display column COL with TEXT."
+  (goto-char (marker-position monad--fraction-rail))
+  (forward-line offset)
+  (move-to-column col t)
+  (delete-region (point) (line-end-position))
+  (insert text))
+
+(defun monad--fraction-update-overlay ()
+  "Update the active fraction overlay."
+  (when (monad--fraction-active-p)
+    (let ((start (monad--fraction-line-start -1))
+          (end (save-excursion
+                 (goto-char (monad--fraction-line-start 1))
+                 (line-end-position))))
+      (unless (overlayp monad--fraction-overlay)
+        (setq monad--fraction-overlay (make-overlay start end nil nil nil)))
+      (move-overlay monad--fraction-overlay start end)
+      (overlay-put monad--fraction-overlay 'priority 1001))))
+
+(defun monad--fraction-point-in-block-p ()
+  "Return non-nil when point is inside the active fraction block."
+  (and (overlayp monad--fraction-overlay)
+       (overlay-buffer monad--fraction-overlay)
+       (>= (point) (overlay-start monad--fraction-overlay))
+       (<= (point) (overlay-end monad--fraction-overlay))))
+
+(defun monad--fraction-goto-field (field index top bottom width col)
+  "Move point to FIELD at INDEX after rendering."
+  (let* ((text (if (eq field 'top) top bottom))
+         (offset (if (eq field 'top) -1 1))
+         (left (/ (max 0 (- width (string-width text))) 2))
+         (idx (max 0 (min (length text) index))))
+    (goto-char (marker-position monad--fraction-rail))
+    (forward-line offset)
+    (move-to-column (+ col left idx) t)))
+
+(defun monad--fraction-render (&optional force-field force-index)
+  "Render the active fraction, preserving point as much as possible."
+  (when (and (monad--fraction-active-p)
+             (not monad--fraction-updating))
+    (let* ((col (monad--fraction-rule-column-at
+                 (marker-position monad--fraction-rail)))
+           (current-field (monad--fraction-current-field))
+           (field (or force-field current-field))
+           (top (monad--fraction-read-line -1 col))
+           (bottom (monad--fraction-read-line 1 col))
+           (width (+ 2 (max 1 (string-width top) (string-width bottom))))
+           (index (or force-index
+                      (monad--fraction-point-index
+                       field col (if (eq field 'top) top bottom)))))
+      (setq monad--fraction-field field)
+      (let ((monad--fraction-updating t)
+            (inhibit-modification-hooks t))
+        (save-excursion
+          (monad--fraction-replace-tail -1 col
+                                        (monad--fraction-center top width))
+          (goto-char (marker-position monad--fraction-rail))
+          (move-to-column col t)
+          (delete-region (point) (line-end-position))
+          (insert (monad--fraction-rule width))
+          (monad--fraction-replace-tail 1 col
+                                        (monad--fraction-center bottom width)))
+        (monad--fraction-update-overlay)
+        (monad--fraction-goto-field field index top bottom width col)))))
+
+(defun monad-fraction-finish ()
+  "Finish the active fraction editor."
+  (interactive)
+  (remove-hook 'post-command-hook #'monad--fraction-post-command t)
+  (when (overlayp monad--fraction-overlay)
+    (delete-overlay monad--fraction-overlay))
+  (when (markerp monad--fraction-rail)
+    (set-marker monad--fraction-rail nil))
+  (setq monad--fraction-overlay nil
+        monad--fraction-field 'top
+        monad--fraction-updating nil))
+
+(defun monad--fraction-post-command ()
+  "Hook: keep the active fraction centered and resized."
+  (when (and (monad--fraction-active-p)
+             (not monad--fraction-updating))
+    (condition-case nil
+        (if (monad--fraction-point-in-block-p)
+            (monad--fraction-render)
+          (monad-fraction-finish))
+      (error
+       (monad-fraction-finish)))))
+
+(defun monad-fraction-toggle-field ()
+  "Switch between the top and bottom fields of the fraction under point."
+  (interactive)
+  (if (monad--fraction-activate-at-point)
+      (let* ((col (monad--fraction-rule-column-at
+                   (marker-position monad--fraction-rail)))
+             (from (monad--fraction-current-field))
+             (top (monad--fraction-read-line -1 col))
+             (bottom (monad--fraction-read-line 1 col))
+             (index (monad--fraction-point-index
+                     from col (if (eq from 'top) top bottom)))
+             (target (if (eq from 'top) 'bottom 'top)))
+        (setq monad--fraction-field target)
+        (monad--fraction-render target index))
+    (indent-for-tab-command)))
+
+(defun monad-tab ()
+  "Indent normally, or switch fields when point is over a fraction."
+  (interactive)
+  (if (monad--fraction-activate-at-point)
+      (monad-fraction-toggle-field)
+    (indent-for-tab-command)))
+
+(defun monad-ret ()
+  "Insert a Monad newline, or jump from fraction top to bottom.
+When point is over the top field of any fraction, RET moves to the bottom
+field.  RET in the bottom field keeps normal newline behavior and exits
+the temporary editor."
+  (interactive)
+  (if (monad--fraction-activate-at-point)
+      (if (eq (monad--fraction-current-field) 'top)
+          (progn
+            (setq monad--fraction-field 'bottom)
+            (monad--fraction-render 'bottom 0))
+        (monad-fraction-finish)
+        (monad-newline))
+    (monad-newline)))
+
+(defun monad-insert-fraction ()
+  "Insert or activate a temporary editable Unicode fraction literal.
+The rule is automatically resized to the longest side plus one space on
+both sides.  TAB switches fields.  RET from the top field jumps to the
+bottom field."
+  (interactive)
+  (if (monad--fraction-activate-at-point)
+      (monad--fraction-render)
+    (monad-fraction-finish)
+    (let* ((line-beg (line-beginning-position))
+           (line-end (line-end-position))
+           (line-raw (buffer-substring-no-properties line-beg line-end))
+           (line-text (string-trim line-raw))
+           (has-top (not (string-empty-p line-text)))
+           (col (if has-top (current-indentation) (current-column)))
+           rail)
+      (if has-top
+          (progn
+            (end-of-line)
+            (insert "\n" (make-string col ?\s)
+                    (monad--fraction-rule (+ 2 (max 1 (string-width line-text))))
+                    "\n" (make-string col ?\s))
+            (forward-line -1)
+            (move-to-column col t)
+            (setq rail (line-beginning-position))
+            (monad--fraction-start-at rail 'bottom)
+            (monad--fraction-render 'bottom 0))
+        (delete-region line-beg line-end)
+        (insert (make-string col ?\s)
+                "\n" (make-string col ?\s) (monad--fraction-rule 3)
+                "\n" (make-string col ?\s))
+        (forward-line -1)
+        (move-to-column col t)
+        (setq rail (line-beginning-position))
+        (monad--fraction-start-at rail 'top)
+        (monad--fraction-render 'top 0)))))
+
+(defun monad--guard-bar-code-position-p (pos line-depth)
+  "Return non-nil when POS is a real guard bar at LINE-DEPTH."
+  (let ((state (syntax-ppss pos)))
+    (and (= (car state) line-depth)
+         (not (nth 3 state))
+         (not (nth 4 state)))))
+
+(defun monad--guard-bar-before-point ()
+  "Return the nearest real guard bar before point on this line."
+  (save-excursion
+    (let ((end (point))
+          (depth (car (syntax-ppss (line-beginning-position))))
+          bar)
+      (goto-char (line-beginning-position))
+      (while (search-forward "|" end t)
+        (let ((pos (1- (point))))
+          (when (monad--guard-bar-code-position-p pos depth)
+            (setq bar pos))))
+      bar)))
+
+(defun monad--guard-bar-at-point-p (square-depth)
+  "Return non-nil when point is on a real guard bar."
+  (and (eq (char-after) ?|)
+       (= square-depth 0)
+       (let ((prev (char-before))
+             (next (char-after (1+ (point)))))
+         (and (or (not prev) (memq prev '(?\s ?\t ?\n)))
+              (or (not next) (memq next '(?\s ?\t ?\n)))))))
+
+(defun monad--guard-target-left-of-point ()
+  "Return the position after the nearest guard bar left of point."
+  (let ((limit (point))
+        (square-depth 0)
+        target)
+    (save-excursion
+      (goto-char (line-beginning-position))
+      (while (< (point) limit)
+        (let ((ch (char-after)))
+          (cond
+           ((eq ch ?[)
+            (setq square-depth (1+ square-depth)))
+           ((eq ch ?])
+            (setq square-depth (max 0 (1- square-depth))))
+           ((monad--guard-bar-at-point-p square-depth)
+            (setq target
+                  (save-excursion
+                    (forward-char 1)
+                    (skip-chars-forward " \t" limit)
+                    (point))))))
+        (forward-char 1)))
+    (and target (< target limit) target)))
+
+(defun monad--guard-target-right-of-point ()
+  "Return the position after the first guard bar right of point."
+  (let ((origin (point))
+        (limit (line-end-position))
+        (square-depth 0)
+        target)
+    (save-excursion
+      (goto-char (line-beginning-position))
+      (while (and (< (point) limit)
+                  (not target))
+        (let ((ch (char-after)))
+          (cond
+           ((eq ch ?[)
+            (setq square-depth (1+ square-depth)))
+           ((eq ch ?])
+            (setq square-depth (max 0 (1- square-depth))))
+           ((monad--guard-bar-at-point-p square-depth)
+            (let ((candidate
+                   (save-excursion
+                     (forward-char 1)
+                     (skip-chars-forward " \t" limit)
+                     (point))))
+              (when (> candidate origin)
+                (setq target candidate))))))
+        (forward-char 1)))
+    target))
+
+(defun monad-beginning-of-line (&optional arg)
+  "Move to the guard expression on the left, or to beginning of line."
+  (interactive "^p")
+  (let ((n (or arg 1)))
+    (if (= n 1)
+        (let ((target (monad--guard-target-left-of-point)))
+          (if target
+              (goto-char target)
+            (move-beginning-of-line 1)))
+      (move-beginning-of-line n))))
+
+(defun monad-end-of-line (&optional arg)
+  "Move to the guard expression on the right, or to end of line."
+  (interactive "^p")
+  (let ((n (or arg 1)))
+    (if (= n 1)
+        (let ((target (monad--guard-target-right-of-point)))
+          (if target
+              (goto-char target)
+            (move-end-of-line 1)))
+      (move-end-of-line n))))
+
 (defvar-keymap monad-mode-map
   :doc "Keymap for Monad mode."
   :parent lisp-mode-shared-map
-  "RET" #'monad-newline
+  "C-a" #'monad-beginning-of-line
+  "C-e" #'monad-end-of-line
+  "RET" #'monad-ret
+  "TAB" #'monad-tab
+  "<tab>" #'monad-tab
   "DEL" #'monad-backward-delete-char-untabify
   "<backspace>" #'monad-backward-delete-char-untabify
   ":" #'monad-colon
   "e" (monad-insert-or "e" 'monad-repl-eval-region)
   "\\" #'monad-insert-lambda
   "C-c C-d" #'monad-show-docstring
+  "C-c C-f" #'monad-insert-fraction
   "C-c m" #'monad-insert-matrix
   "C-c C-c" #'monad-compile-and-run
   "C-c t" #'monad-compile-and-run-tests
