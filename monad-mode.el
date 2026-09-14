@@ -93,6 +93,7 @@
 (require 'cl-lib)
 (require 'eldoc)
 (require 'xref)
+(require 'org)
 (require 'porg nil t)
 (require 'rainbow-delimiters)
 (require 'monad-repl nil t)
@@ -173,6 +174,47 @@ keyword occurs inside something Monad itself recognizes as comment text."
           :key-type (string :tag "Keyword")
           :value-type (repeat :tag "Faces" face))
   :group 'monad)
+
+(defcustom monad-hide-leading-ascii-alias nil
+  "When non-nil, visually collapse dual aliases in typed bracketed defines.
+
+Example:
+
+  define [pi π :: Float] 3.14
+
+is displayed as:
+
+  define [π   :: Float] 3.14
+
+Only the display changes; the buffer text itself is never modified.
+
+This only applies when the first alias is ASCII and a second alias is
+present before `::'."
+  :type 'boolean
+  :group 'monad)
+
+(defcustom monad-visual-secondary-alias-width 4
+  "Visual width of the displayed alias field.
+
+When `monad-hide-leading-ascii-alias' is non-nil, the visible alias is
+right-padded to this width so the following `::' stays aligned.
+
+A width of 4 matches displays such as:
+
+  π   :: Float
+  τ   :: Float
+  π/2 :: Float"
+  :type 'integer
+  :group 'monad)
+
+(defconst monad--visual-secondary-alias-regexp
+  "^\\s-*\\(?:define\\|method\\)\\s-+\\[\\([^][ \t\n]+\\)\\([ \t]+\\)\\([^][ \t\n]+\\)\\([ \t]+\\)::"
+  "Regexp matching typed bracketed defines with two aliases.
+
+Matches forms like:
+
+  define [pi π :: Float] ...
+  define [half-pi π/2 :: Float] ...")
 
 (defface monad-path-literal-face
   '((t :inherit font-lock-constant-face))
@@ -934,6 +976,60 @@ itself."
               (setq found t))
           (goto-char (min block-end (max (point) limit))))))
     found))
+
+(defun monad--ascii-only-string-p (string)
+  "Return non-nil when STRING contains only ASCII characters."
+  (and string
+       (string-match-p "\\`[[:ascii:]]+\\'" string)))
+
+(defun monad--visual-secondary-alias-string (alias)
+  "Return the visual replacement string for ALIAS."
+  (let* ((width (max 1 monad-visual-secondary-alias-width))
+         (padding (max 1 (- width (string-width alias)))))
+    (concat alias (make-string padding ?\s))))
+
+(defun monad--clear-visual-secondary-aliases (beg end)
+  "Remove Monad visual secondary-alias display properties from BEG to END."
+  (let ((pos beg)
+        next)
+    (while (< pos end)
+      (setq next
+            (or (next-single-property-change
+                 pos 'monad-visual-secondary-alias nil end)
+                end))
+      (when (get-text-property pos 'monad-visual-secondary-alias)
+        (remove-text-properties
+         pos next
+         '(display nil
+                   monad-visual-secondary-alias nil)))
+      (setq pos next))))
+
+(defun monad--jit-fontify-visual-secondary-aliases (beg end)
+  "Visually collapse leading ASCII aliases between BEG and END.
+
+This is purely cosmetic and never edits the actual buffer text."
+  (save-excursion
+    (let ((beg (progn (goto-char beg) (line-beginning-position)))
+          (end (progn (goto-char end) (line-end-position))))
+      (monad--clear-visual-secondary-aliases beg end)
+      (when monad-hide-leading-ascii-alias
+        (goto-char beg)
+        (while (re-search-forward monad--visual-secondary-alias-regexp end t)
+          (let* ((ascii (match-string-no-properties 1))
+                 (alias (match-string-no-properties 3))
+                 (field-beg (match-beginning 1))
+                 (field-end (match-end 4)))
+            (when (and (monad--ascii-only-string-p ascii)
+                       (monad--font-lock-code-position-p field-beg))
+              (put-text-property
+               field-beg field-end
+               'display
+               (propertize
+                (monad--visual-secondary-alias-string alias)
+                'face 'font-lock-function-name-face))
+              (put-text-property
+               field-beg field-end
+               'monad-visual-secondary-alias t))))))))
 
 ;;; Infix backtick support
 
@@ -3348,7 +3444,9 @@ clauses, since those are always indented and never begin at column 0."
                       found))
                   (list subexp face nil t))))
              asm-keywords))
-   nil))
+   ;; Org-style #+begin_src ... #+end_src blocks.  Keep this matcher last so
+   ;; the embedded language's native faces override Monad and asm faces.
+   (list '(org-fontify-meta-lines-and-blocks))))
 
 ;; Set up docstring detection
 (put 'lambda 'monad-doc-string-elt 2)
@@ -3895,6 +3993,15 @@ Priority rules:
           (font-lock-mark-block-function . mark-defun)
           (font-lock-syntactic-face-function
            . monad-syntactic-face-function)))
+
+  (jit-lock-register #'monad--jit-fontify-visual-secondary-aliases)
+
+  (add-hook 'change-major-mode-hook
+            (lambda ()
+              (jit-lock-unregister
+               #'monad--jit-fontify-visual-secondary-aliases))
+            nil t)
+
   (setq-local lisp-doc-string-elt-property 'monad-doc-string-elt)
   (local-set-key (kbd "M-;") #'monad-comment-dwim)
   (local-set-key (kbd "C-o") #'monad-open-line)
@@ -4576,6 +4683,96 @@ found inside a string or comment."
   (and (looking-at monad--modal-keyword-regexp)
        (monad--modal-keyword-code-position-p (point))))
 
+(defconst monad--modal-drawer-regexp
+  "^[ \t]*:\\([^:\n]+\\):[ \t]*$"
+  "Regexp matching a Monad drawer delimiter line.")
+
+(defun monad--modal-drawer-marker-info-at (pos)
+  "Return drawer marker information for the line containing POS.
+
+The result is:
+
+  (NAME INDENT MARKER-POS)
+
+where MARKER-POS is the position of the opening colon.
+
+Return nil when the line is not a real Monad drawer delimiter."
+  (save-excursion
+    (goto-char pos)
+    (beginning-of-line)
+    (when (looking-at monad--modal-drawer-regexp)
+      (let ((name (match-string-no-properties 1))
+            (indent (current-indentation)))
+        (back-to-indentation)
+        (let ((marker-pos (point)))
+          (when (monad--font-lock-code-position-p marker-pos)
+            (list name indent marker-pos)))))))
+
+(defun monad--modal-drawer-opening-position-p (pos)
+  "Return non-nil when POS belongs to an opening drawer delimiter.
+
+Monad drawers use identical opening and closing delimiters, so markers
+with the same name and indentation are paired in source order:
+
+  :name:       opening
+  ...
+  :name:       closing"
+  (when-let ((info (monad--modal-drawer-marker-info-at pos)))
+    (pcase-let ((`(,name ,indent ,marker-pos) info))
+      (let ((regexp
+             (format "^[ \t]*:%s:[ \t]*$"
+                     (regexp-quote name)))
+            (count 0))
+        (save-excursion
+          (goto-char (point-min))
+          (while (re-search-forward regexp marker-pos t)
+            ;; Inspect the match without changing the search cursor.
+            (let ((match-pos (match-beginning 0)))
+              (save-excursion
+                (goto-char match-pos)
+                (when (= (current-indentation) indent)
+                  (back-to-indentation)
+                  (when (monad--font-lock-code-position-p (point))
+                    (setq count (1+ count))))))))
+        ;; Include the marker at POS itself.  `re-search-forward' with
+        ;; MARKER-POS as its bound stops before that marker's contents.
+        (setq count (1+ count))
+        (= (% count 2) 1)))))
+
+(defun monad--modal-drawer-at-point-p ()
+  "Return non-nil when point is on an opening Monad drawer delimiter."
+  (and (eq (char-after) ?:)
+       (= (point)
+          (save-excursion
+            (back-to-indentation)
+            (point)))
+       (monad--modal-drawer-opening-position-p (point))))
+
+(defun monad--modal-drawer-search (direction)
+  "Return the next opening drawer position in DIRECTION.
+
+DIRECTION is positive for forward navigation and negative for backward
+navigation.  Closing drawer delimiters are always skipped."
+  (let ((forwardp (> direction 0)))
+    (save-excursion
+      ;; Never rediscover the drawer on the current line.
+      (if forwardp
+          (forward-line 1)
+        (beginning-of-line))
+      (catch 'target
+        (while
+            (if forwardp
+                (re-search-forward monad--modal-drawer-regexp nil t)
+              (re-search-backward monad--modal-drawer-regexp nil t))
+          (goto-char (match-beginning 0))
+          (back-to-indentation)
+          (let ((pos (point)))
+            (if (monad--modal-drawer-opening-position-p pos)
+                (throw 'target pos)
+              (when forwardp
+                (forward-line 1)))))
+        nil))))
+
 (defun monad--modal-target-at-point ()
   "Return the modal target kind at point, or nil."
   (cond
@@ -4646,6 +4843,28 @@ non-`data' keywords and real guard pipes are considered together."
                     (monad--modal-keyword-code-position-p pos))
               (throw 'target pos))))
         nil))))
+
+(defun monad--modal-drawer-or-keyword-search (direction)
+  "Return the nearest opening drawer or Monad keyword in DIRECTION.
+
+This is used when lowercase j/k starts on a drawer.  It lets a drawer
+act as a structural stop without creating a separate navigation mode:
+
+  :outer:
+    :inner:
+    assert-eq ...
+
+j from :outer: visits :inner:, then the keyword."
+  (let ((drawer (monad--modal-drawer-search direction))
+        (keyword (monad--modal-search direction 'keyword)))
+    (cond
+     ((and drawer keyword)
+      (if (> direction 0)
+          (min drawer keyword)
+        (max drawer keyword)))
+     (drawer drawer)
+     (keyword keyword)
+     (t nil))))
 
 (defun monad--modal-jump-or-insert (direction)
   "Move through modal targets in DIRECTION, or self-insert off a target.
@@ -4971,11 +5190,19 @@ Otherwise insert `s' normally."
 (defun monad-guard-j ()
   "Jump forward according to Monad modal navigation.
 
+On an opening drawer, move to the nearest following opening drawer or
+Monad keyword.
+
 On `(', jump to the next code opening parenthesis.
 Immediately after `)', jump to the end of the next code list.
 Otherwise preserve the existing j behavior."
   (interactive)
   (cond
+   ((monad--modal-drawer-at-point-p)
+    (if-let ((target (monad--modal-drawer-or-keyword-search 1)))
+        (goto-char target)
+      (message "No next drawer or Monad keyword")))
+
    ((monad--modal-open-paren-at-point-p)
     (if-let* ((target (monad--modal-paren-search 1)))
         (goto-char target)
@@ -4992,11 +5219,19 @@ Otherwise preserve the existing j behavior."
 (defun monad-guard-k ()
   "Jump backward according to Monad modal navigation.
 
+On an opening drawer, move to the nearest preceding opening drawer or
+Monad keyword.
+
 On `(', jump to the previous code opening parenthesis.
 Immediately after `)', jump to the end of the previous code list.
 Otherwise preserve the existing k behavior."
   (interactive)
   (cond
+   ((monad--modal-drawer-at-point-p)
+    (if-let ((target (monad--modal-drawer-or-keyword-search -1)))
+        (goto-char target)
+      (message "No previous drawer or Monad keyword")))
+
    ((monad--modal-open-paren-at-point-p)
     (if-let* ((target (monad--modal-paren-search -1)))
         (goto-char target)
@@ -5232,14 +5467,18 @@ Anything else is left untouched."
       (goto-char target))))
 
 (defun monad-guard-shift-j ()
-  "Navigate forward according to the strict S-j rules."
+  "Jump exclusively to the next opening Monad drawer."
   (interactive)
-  (monad--modal-shift-jump 1))
+  (if-let ((target (monad--modal-drawer-search 1)))
+      (goto-char target)
+    (message "No next Monad drawer")))
 
 (defun monad-guard-shift-k ()
-  "Navigate backward according to the strict S-k rules."
+  "Jump exclusively to the previous opening Monad drawer."
   (interactive)
-  (monad--modal-shift-jump -1))
+  (if-let ((target (monad--modal-drawer-search -1)))
+      (goto-char target)
+    (message "No previous Monad drawer")))
 
 (defun monad-comment-dwim ()
   "Insert -| comment, or close with |- if current line has an unclosed -|."
@@ -5992,12 +6231,129 @@ FIELD remembers the field point is currently editing."
         (monad--fraction-select-field target col))
     (indent-for-tab-command)))
 
+(defvar-local monad--drawer-overlays nil
+  "Overlays currently hiding Monad drawer bodies.")
+
+(defun monad--drawer-marker-at-line ()
+  "Return (NAME INDENT BOL) when the current line is a Monad drawer marker.
+
+A drawer marker is a line containing only:
+
+  :name:
+
+with optional indentation and trailing whitespace."
+  (save-excursion
+    (beginning-of-line)
+    (when (looking-at "^[ \t]*:\\([^:\n]+\\):[ \t]*$")
+      (let ((name (match-string-no-properties 1))
+            (pos  (match-beginning 1)))
+        (when (monad--font-lock-code-position-p pos)
+          (list name
+                (current-indentation)
+                (line-beginning-position)))))))
+
+(defun monad--drawer-bounds-at-line ()
+  "Return bounds of the Monad drawer whose marker is on the current line.
+
+The result is:
+
+  (OPEN BODY-START CLOSE)
+
+OPEN is the beginning of the opening marker line.
+BODY-START is the beginning of the first line inside the drawer.
+CLOSE is the beginning of the closing marker line.
+
+Matching markers must have the same name and indentation."
+  (when-let ((marker (monad--drawer-marker-at-line)))
+    (let* ((name   (nth 0 marker))
+           (indent (nth 1 marker))
+           (here   (nth 2 marker))
+           (regexp
+            (format "^[ \t]*:%s:[ \t]*$"
+                    (regexp-quote name)))
+           positions)
+      (save-excursion
+        (goto-char (point-min))
+        (while (re-search-forward regexp nil t)
+          (goto-char (match-beginning 0))
+          (when (and (= (current-indentation) indent)
+                     (monad--font-lock-code-position-p
+                      (save-excursion
+                        (back-to-indentation)
+                        (1+ (point)))))
+            (push (line-beginning-position) positions))
+          (forward-line 1)))
+
+      (setq positions (nreverse positions))
+
+      (when-let ((index (cl-position here positions :test #'=)))
+        (let* ((opening-p (zerop (% index 2)))
+               (open
+                (if opening-p
+                    (nth index positions)
+                  (nth (1- index) positions)))
+               (close
+                (if opening-p
+                    (nth (1+ index) positions)
+                  (nth index positions))))
+          (when (and open close)
+            (list
+             open
+             (save-excursion
+               (goto-char open)
+               (forward-line 1)
+               (point))
+             close)))))))
+
+(defun monad--drawer-overlay-for-open (open)
+  "Return the active drawer overlay beginning at OPEN, or nil."
+  (setq monad--drawer-overlays
+        (cl-delete-if-not #'overlay-buffer monad--drawer-overlays))
+  (cl-find-if
+   (lambda (overlay)
+     (equal (overlay-get overlay 'monad-drawer-open) open))
+   monad--drawer-overlays))
+
+(defun monad--drawer-toggle-at-point ()
+  "Toggle the Monad drawer on the current line.
+
+Return non-nil whenever the current line is a drawer marker, so TAB
+never falls through to indentation on drawer delimiters."
+  (when (monad--drawer-marker-at-line)
+    (if-let ((bounds (monad--drawer-bounds-at-line)))
+        (pcase-let ((`(,open ,body-start ,close) bounds))
+          (if-let ((overlay (monad--drawer-overlay-for-open open)))
+              (progn
+                (delete-overlay overlay)
+                (setq monad--drawer-overlays
+                      (delq overlay monad--drawer-overlays))
+                (message "DRAWER SHOWN"))
+            (add-to-invisibility-spec 'monad-drawer)
+            (let ((overlay (make-overlay body-start close)))
+              (overlay-put overlay 'invisible 'monad-drawer)
+              (overlay-put overlay 'monad-drawer-open open)
+              (overlay-put overlay 'isearch-open-invisible
+                           #'delete-overlay)
+              (push overlay monad--drawer-overlays)
+              (message "DRAWER HIDDEN"))))
+      ;; It still is a drawer-looking delimiter.  Never indent it merely
+      ;; because its mate is temporarily missing.
+      (message "Unmatched Monad drawer"))
+    t))
+
 (defun monad-tab ()
-  "Indent normally, or switch fields when point is over a fraction."
+  "Cycle drawers, switch fraction fields, or indent normally.
+
+On a Monad drawer delimiter such as `:tests:', TAB toggles visibility
+of everything between the matching delimiters without changing
+indentation."
   (interactive)
-  (if (monad--fraction-activate-at-point)
-      (monad-fraction-toggle-field)
-    (indent-for-tab-command)))
+  (cond
+   ((monad--fraction-activate-at-point)
+    (monad-fraction-toggle-field))
+   ((monad--drawer-toggle-at-point))
+   (t
+    (indent-for-tab-command))))
 
 (defun monad--delete-pending-type-arrow-before-newline ()
   "Delete a trailing pending type arrow before inserting a newline."

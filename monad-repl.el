@@ -1402,6 +1402,8 @@ BEG and END are the region boundaries."
   "Set up REPL keybindings in `monad-mode-map'.
 This should be called from `monad-mode' initialization."
   (when (boundp 'monad-mode-map)
+    (define-key monad-mode-map (vector ?\\)
+      (lambda () (interactive) (insert "λ")))
     (define-key monad-mode-map (kbd "C-c C-z") #'monad-repl)
     (define-key monad-mode-map (kbd "C-c C-r") #'monad-repl-eval-region)
     (define-key monad-mode-map (kbd "C-c C-b") #'monad-repl-eval-buffer)
