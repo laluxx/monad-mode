@@ -256,6 +256,16 @@ Matches forms like:
   "Face for =code= spans inside any Monad comment."
   :group 'monad)
 
+(defface monad-metadata-keyword-value-face
+  '((t :inherit font-lock-variable-name-face))
+  "Face for values following the :keywords metadata key."
+  :group 'monad)
+
+(defface monad-link-face
+  '((t :inherit font-lock-keyword-face))
+  "Face for links following colon-prefixed Monad keywords."
+  :group 'monad)
+
 (defvar monad-mode-syntax-table
   (let ((st (make-syntax-table))
         (i 0))
@@ -3201,6 +3211,21 @@ This matcher always moves forward and does not call `up-list'."
           (throw 'found t))))
     nil))
 
+(defun monad-metadata-link-matcher (limit)
+  "Match values following :reference-* metadata keys up to LIMIT."
+  (catch 'found
+    (while
+        (re-search-forward
+         "^\\s-*:reference-\\(?:\\sw\\|\\s_\\)+\\_>[ \t]+\\([^ \t\n]+\\)"
+         limit t)
+      (let ((beg (match-beginning 1))
+            (end (match-end 1)))
+        (when (and beg end
+                   (monad--font-lock-code-position-p beg))
+          (set-match-data (list beg end beg end))
+          (throw 'found t))))
+    nil))
+
 (defun monad-alias-value-matcher (limit)
   "Match the value after :alias up to LIMIT."
   (catch 'found
@@ -3393,8 +3418,15 @@ clauses, since those are always indented and never begin at column 0."
     (cons (regexp-opt (remove "asm" monad-keywords) 'symbols)
           'font-lock-keyword-face)
     '("::" . font-lock-builtin-face)
-    '(":\\(?:\\sw\\|\\s_\\)+"
-      (0 font-lock-builtin-face))
+    '(monad-metadata-keyword-matcher
+      (0 font-lock-builtin-face t))
+
+    '("^\\s-*:keywords\\_>[ \t]+\\([^;\n]+\\)"
+      (1 'monad-metadata-keyword-value-face t))
+
+    '(monad-metadata-link-matcher
+      (0 'monad-link-face t))
+
     '("\\(:doc\\_>\\)[ \t\n]+\\(\"\\(?:[^\"\\]\\|\\\\.\\)*\"\\)"
       (1 font-lock-builtin-face t)
       (2 font-lock-doc-face t))
@@ -5467,18 +5499,28 @@ Anything else is left untouched."
       (goto-char target))))
 
 (defun monad-guard-shift-j ()
-  "Jump exclusively to the next opening Monad drawer."
+  "Navigate forward according to the strict J rules.
+
+When point is on an opening Monad drawer, jump to the next opening
+drawer.  Otherwise preserve the existing strict J navigation logic."
   (interactive)
-  (if-let ((target (monad--modal-drawer-search 1)))
-      (goto-char target)
-    (message "No next Monad drawer")))
+  (if (monad--modal-drawer-at-point-p)
+      (if-let ((target (monad--modal-drawer-search 1)))
+          (goto-char target)
+        (message "No next Monad drawer"))
+    (monad--modal-shift-jump 1)))
 
 (defun monad-guard-shift-k ()
-  "Jump exclusively to the previous opening Monad drawer."
+  "Navigate backward according to the strict K rules.
+
+When point is on an opening Monad drawer, jump to the previous opening
+drawer.  Otherwise preserve the existing strict K navigation logic."
   (interactive)
-  (if-let ((target (monad--modal-drawer-search -1)))
-      (goto-char target)
-    (message "No previous Monad drawer")))
+  (if (monad--modal-drawer-at-point-p)
+      (if-let ((target (monad--modal-drawer-search -1)))
+          (goto-char target)
+        (message "No previous Monad drawer"))
+    (monad--modal-shift-jump -1)))
 
 (defun monad-comment-dwim ()
   "Insert -| comment, or close with |- if current line has an unclosed -|."
@@ -6659,6 +6701,7 @@ fraction.  TAB switches fields and selects the destination field."
 
 ;;;###autoload
 (add-to-list 'auto-mode-alist '("\\.mon\\'" . monad-mode))
+
 
 (provide 'monad-mode)
 ;;; monad-mode.el ends here
